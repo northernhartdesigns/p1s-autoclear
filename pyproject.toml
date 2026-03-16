@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p1s-autoclear"
+version = "0.1.0"
+description = "NHDFARM-style G-code injection for Bambu P1S auto-clear automation"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["3d-printing", "bambu", "p1s", "nhdfarm", "gcode"]
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+]
+
+[project.optional-dependencies]
+run_loop = ["bambulabs_api>=2.6.0"]
+preview = ["trimesh>=4.0"]
+dev = ["pytest"]
+
+[project.scripts]
+p1s-autoclear = "p1s_autoclear.gui:main"
+p1s-run-loop = "p1s_autoclear.run_loop:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["p1s_autoclear*"]
+
+[tool.setuptools.package-data]
+p1s_autoclear = ["data/*.3mf"]
