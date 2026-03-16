@@ -175,6 +175,23 @@ def get_vertices_from_3mf(path: str | Path) -> list[tuple[float, float, float]] 
         return None
 
 
+def get_part_bounds_from_3mf(path: str | Path) -> tuple[float, float] | None:
+    """
+    Extract part center X and back Y from 3MF mesh for targeted bump push.
+    center_x = (min_x + max_x) / 2, back_y = max_y (rear edge of part).
+    Returns (center_x, back_y) or None if mesh unavailable (trimesh required).
+    Falls back gracefully: use (125, 250) when None.
+    """
+    verts = get_vertices_from_3mf(path)
+    if not verts:
+        return None
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    center_x = (min(xs) + max(xs)) / 2
+    back_y = max(ys)  # Rear edge toward Y=250
+    return (center_x, back_y)
+
+
 def compute_sweep_z(
     max_layer_z: float,
     push_height_mode: str,

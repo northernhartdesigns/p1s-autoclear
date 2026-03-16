@@ -300,12 +300,12 @@ def create_gui() -> tk.Tk:
     push_mode_combo = ttk.Combobox(
         push_mode_row,
         textvariable=push_mode_var,
-        values=("center_only", "center_and_sweep"),
+        values=("center_only", "center_and_sweep", "bump"),
         width=18,
         state="readonly",
     )
     push_mode_combo.pack(side=tk.LEFT)
-    _create_tooltip(push_mode_combo, "Center only: two pushes at center X. Center + sweep: center pushes plus right-to-left rake passes.")
+    _create_tooltip(push_mode_combo, "Center only: two pushes at center X. Center + sweep: center pushes plus rake passes. Bump: single targeted push at part center/back (requires trimesh).")
 
     # --- Push height section (NHDFARM-style) ---
     heights_frame = ttk.LabelFrame(main_tab, text="Push Height", padding=6)
@@ -897,6 +897,7 @@ PUSH MODE
 ---------
 • center_only: Two pushes forward at center X (125 mm) only. No rake passes.
 • center_and_sweep: Center pushes + right-to-left rake passes (full Auto-Clear style).
+• bump: Single targeted push at part center and back (from mesh). Requires pip install p1s-autoclear[preview]. Falls back to bed center if mesh unavailable.
 
 BENDING
 -------------------

@@ -133,7 +133,7 @@ def autoclear_to_gui_settings(autoclear: dict[str, Any]) -> dict[str, Any]:
         out["bending_mode"] = "on" if bm in ("nhdfarm", "farmloop") else "off"
     if "push_mode" in autoclear:
         pm = str(autoclear["push_mode"])
-        out["push_mode"] = "center_and_sweep" if pm not in ("center_only", "center_and_sweep") else pm
+        out["push_mode"] = "center_and_sweep" if pm not in ("center_only", "center_and_sweep", "bump") else pm
     # Legacy migration: push_heights -> push_height_mode "auto" or manual with first value
     if "push_height_mode" not in out and "push_heights" in autoclear:
         ph = autoclear["push_heights"]
@@ -230,7 +230,7 @@ def apply_settings_to_gui(
         bending_mode_var.set("on" if bm in ("nhdfarm", "farmloop", "on") else "off")
     if push_mode_var is not None and "push_mode" in data:
         pm = str(data["push_mode"])
-        push_mode_var.set("center_and_sweep" if pm not in ("center_only", "center_and_sweep") else pm)
+        push_mode_var.set("center_and_sweep" if pm not in ("center_only", "center_and_sweep", "bump") else pm)
     if template_text is not None and default_template:
         template_text.delete("1.0", "end")
         tpl = (data.get("template") or "").strip() if isinstance(data.get("template"), str) else ""

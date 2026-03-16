@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bump push mode**: single targeted push at part center and back (from mesh). Uses `get_part_bounds_from_3mf` (requires trimesh `[preview]`). Falls back to bed center when mesh unavailable.
 - Last-used settings: app remembers cooldown, push heights, purge line, template, loop count
 - Filament profiles: save/load presets (PLA, PETG, ABS/ASA + custom)
 - Full settings stored in 3MF: reopening exported files restores all settings

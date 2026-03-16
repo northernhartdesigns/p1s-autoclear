@@ -23,6 +23,7 @@ from .injector import (
     remove_purge_line_from_start_gcode,
     wrap_plate_gcode_in_loops,
 )
+from .preview import get_part_bounds_from_3mf
 
 
 AUTOCLEAR_SETTINGS_PATH = "Metadata/p1s_autoclear_settings.json"
@@ -93,6 +94,8 @@ def process_3mf(
         output_path = input_path.parent / f"{stem}_autoclear.3mf"
     output_path = Path(output_path)
 
+    part_bounds = get_part_bounds_from_3mf(input_path) if push_mode == "bump" else None
+
     loop_count = max(1, min(999, loop_count))
     preheat_bed_temp = max(0, min(150, preheat_bed_temp))
     preheat_nozzle_temp = max(0, min(300, preheat_nozzle_temp))
@@ -126,6 +129,7 @@ def process_3mf(
             preheat_bed_temp=preheat_bed_temp,
             preheat_nozzle_temp=preheat_nozzle_temp,
             loop_count=loop_count,
+            part_bounds=part_bounds,
         )
 
     with zipfile.ZipFile(input_path, "r") as zf_in:
@@ -189,6 +193,7 @@ def process_3mf(
                         preheat_bed_temp=preheat_bed_temp,
                         preheat_nozzle_temp=preheat_nozzle_temp,
                         loop_count=loop_count,
+                        part_bounds=part_bounds,
                     )
                     gcode = inject_autoclear_into_plate_gcode(gcode, plate_block)
             if remove_purge_line:

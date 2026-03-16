@@ -102,6 +102,22 @@ def test_build_injection_block_no_g28_z_matches_autoclear():
     assert not re.search(r"^\s*G28\s+Z\b", result, re.MULTILINE), "Should not emit G28 Z command"
 
 
+def test_build_injection_block_bump_mode():
+    """push_mode bump: single targeted push at part center/back."""
+    result = build_injection_block(
+        cooldown_mode="temp",
+        cooldown_value=40,
+        push_height_mode="manual",
+        push_height_mm=5,
+        push_mode="bump",
+        part_bounds=(60.0, 120.0),
+    )
+    assert "targeted bump" in result
+    assert "G1 X60.0 Y120.0" in result
+    assert "G1 Y0" in result
+    assert "rake" not in result
+
+
 def test_build_injection_block_has_xy_park():
     """Injection block includes XY park (match Auto-Clear end section)."""
     result = build_injection_block(

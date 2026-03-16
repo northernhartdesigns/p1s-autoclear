@@ -58,6 +58,34 @@ def build_bending_block(mode: str) -> str:
     return ""
 
 
+# Bed center fallback when mesh unavailable for bump mode
+BED_CENTER_X = 125.0
+BED_BACK_Y = 250.0
+
+
+def build_bump_block(
+    center_x: float,
+    back_y: float,
+    z_expr: str,
+    y_front: float = 0,
+    speed_push: int = 3000,
+) -> str:
+    """
+    Single targeted push at part center and back (bump mode).
+    Positions at (center_x, back_y), then one push forward to y_front.
+    """
+    return "\n".join([
+        "; -------- choose sweep height ----------",
+        f"G1 Z{z_expr} F10000",
+        "M400",
+        "",
+        "; -------- targeted bump at part center/back --------",
+        f"G1 X{center_x:.1f} Y{back_y:.1f} F{speed_push}",
+        f"G1 Y{y_front} F{speed_push}",
+        "",
+    ])
+
+
 def build_nhdfarm_sweep_block(  # noqa: D213
     push_height_mode: str = "auto",
     push_height_mm: float = 5.0,
@@ -166,10 +194,13 @@ def build_injection_block_expanded(
     preheat_bed_temp: int = 70,
     preheat_nozzle_temp: int = 150,
     loop_count: int = 1,
+    *,
+    part_bounds: tuple[float, float] | None = None,
 ) -> str:
     """
     Build auto-clear block with concrete values for injection into plate gcode.
     Same as build_injection_block but sweep Z is expanded (no placeholders).
+    When push_mode is 'bump', uses part_bounds (center_x, back_y) from mesh; falls back to bed center if None.
     """
     cooldown_line = build_cooldown_line(cooldown_mode, cooldown_value)
     if fans_during_cooldown:
@@ -180,13 +211,22 @@ def build_injection_block_expanded(
             + cooldown_line
         )
     bending = build_bending_block(bending_mode)
-    sweeps = build_nhdfarm_sweep_block_expanded(
-        max_layer_z=max_layer_z,
-        push_height_mode=push_height_mode,
-        push_height_mm=push_height_mm,
-        push_height_offset_mm=push_height_offset_mm,
-        push_mode=push_mode,
-    )
+    if push_mode == "bump":
+        cx, cy = part_bounds or (BED_CENTER_X, BED_BACK_Y)
+        if push_height_mode == "auto":
+            offset = max(5, min(50, int(push_height_offset_mm)))
+            z_val = max(0.0, max_layer_z - offset)
+        else:
+            z_val = max(1.0, push_height_mm)
+        sweeps = build_bump_block(center_x=cx, back_y=cy, z_expr=f"{z_val:.2f}")
+    else:
+        sweeps = build_nhdfarm_sweep_block_expanded(
+            max_layer_z=max_layer_z,
+            push_height_mode=push_height_mode,
+            push_height_mm=push_height_mm,
+            push_height_offset_mm=push_height_offset_mm,
+            push_mode=push_mode,
+        )
     template = template or DEFAULT_TEMPLATE
     if "{bending}" not in template and "{sweeps}" in template:
         template = template.replace("\n\n{sweeps}", "\n\n{bending}\n\n{sweeps}")
@@ -396,6 +436,7 @@ def build_injection_block(
     *,
     push_heights: list[float] | None = None,
     use_plate_flex: bool | None = None,
+    part_bounds: tuple[float, float] | None = None,
 ) -> str:
     """
     Build the full injection block from config.
@@ -424,12 +465,21 @@ def build_injection_block(
         )
     else:
         bending = build_bending_block(bending_mode)
-        sweeps = build_nhdfarm_sweep_block(
-            push_height_mode=push_height_mode,
-            push_height_mm=push_height_mm,
-            push_height_offset_mm=push_height_offset_mm,
-            push_mode=push_mode,
-        )
+        if push_mode == "bump":
+            cx, cy = part_bounds or (BED_CENTER_X, BED_BACK_Y)
+            if push_height_mode == "auto":
+                offset = max(1, min(249, int(push_height_offset_mm)))
+                z_expr = f"{{max(1, max_layer_z - {offset})}}"
+            else:
+                z_expr = str(max(1.0, push_height_mm))
+            sweeps = build_bump_block(center_x=cx, back_y=cy, z_expr=z_expr)
+        else:
+            sweeps = build_nhdfarm_sweep_block(
+                push_height_mode=push_height_mode,
+                push_height_mm=push_height_mm,
+                push_height_offset_mm=push_height_offset_mm,
+                push_mode=push_mode,
+            )
     template = template or DEFAULT_TEMPLATE
     # Backward compat: old templates use {plate_flex}, new use {bending}
     if "{bending}" not in template and "{plate_flex}" in template:
