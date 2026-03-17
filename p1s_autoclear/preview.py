@@ -177,19 +177,476 @@ def get_vertices_from_3mf(path: str | Path) -> list[tuple[float, float, float]] 
 
 def get_part_bounds_from_3mf(path: str | Path) -> tuple[float, float] | None:
     """
-    Extract part center X and back Y from 3MF mesh for targeted bump push.
-    center_x = (min_x + max_x) / 2, back_y = max_y (rear edge of part).
-    Returns (center_x, back_y) or None if mesh unavailable (trimesh required).
-    Falls back gracefully: use (125, 250) when None.
+    Extract part center X and back Y from 3MF for targeted bump push.
+    Requires mesh (trimesh); returns None for sliced .gcode.3mf with no mesh.
+    Use (125, 250) when None.
     """
     verts = get_vertices_from_3mf(path)
-    if not verts:
+    if verts:
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        return ((min(xs) + max(xs)) / 2, max(ys))
+    return None
+
+
+# Bed dimensions for preview (Bambu P1S)
+BED_X_MIN, BED_X_MAX = 0.0, 256.0
+BED_Y_MIN, BED_Y_MAX = 0.0, 256.0
+Y_FRONT, Y_BACK = 0.0, 250.0
+X_CENTRAL = 125.0
+X_RAKE_POSITIONS = (220, 190, 160, 130, 100, 70, 30)
+
+
+def get_parts_from_3mf(path: str | Path) -> list[dict[str, float]]:
+    """
+    Extract per-part bounds from 3MF. Each part returns dict with
+    min_x, max_x, min_y, max_y, min_z, max_z, center_x, back_y.
+    Returns [] if mesh unavailable (trimesh required).
+    """
+    if not TRIMESH_AVAILABLE:
+        return []
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        loaded = trimesh.load(str(path))
+        if loaded is None:
+            return []
+        parts: list[dict[str, float]] = []
+        if hasattr(loaded, "geometry"):
+            for _name, geom in loaded.geometry.items():
+                if not hasattr(geom, "vertices"):
+                    continue
+                verts = geom.vertices
+                if len(verts) == 0:
+                    continue
+                xs = [float(v[0]) for v in verts]
+                ys = [float(v[1]) for v in verts]
+                zs = [float(v[2]) for v in verts]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                min_z, max_z = min(zs), max(zs)
+                parts.append({
+                    "min_x": min_x, "max_x": max_x,
+                    "min_y": min_y, "max_y": max_y,
+                    "min_z": min_z, "max_z": max_z,
+                    "center_x": (min_x + max_x) / 2,
+                    "back_y": max_y,
+                })
+        elif hasattr(loaded, "vertices"):
+            verts = loaded.vertices
+            xs = [float(v[0]) for v in verts]
+            ys = [float(v[1]) for v in verts]
+            zs = [float(v[2]) for v in verts]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            min_z, max_z = min(zs), max(zs)
+            parts.append({
+                "min_x": min_x, "max_x": max_x,
+                "min_y": min_y, "max_y": max_y,
+                "min_z": min_z, "max_z": max_z,
+                "center_x": (min_x + max_x) / 2,
+                "back_y": max_y,
+            })
+        return parts
+    except Exception:
+        return []
+
+
+def get_pusher_path_segments(
+    push_mode: str,
+    part_bounds: tuple[float, float] | None = None,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Return pusher path as list of (x1, y1, x2, y2) line segments.
+    push_mode: center_only, center_and_sweep, or bump.
+    part_bounds: (center_x, back_y) for bump mode; None uses bed center.
+    """
+    cx = X_CENTRAL
+    back_y = Y_BACK
+    front_y = Y_FRONT
+    if push_mode == "bump" and part_bounds:
+        cx, back_y = part_bounds[0], part_bounds[1]
+
+    segments: list[tuple[float, float, float, float]] = []
+
+    # Central sweeps (all modes)
+    segments.append((cx, back_y, cx, front_y))
+    segments.append((cx, front_y, cx, back_y))
+    segments.append((cx, back_y, cx, front_y))
+
+    if push_mode == "center_only":
+        return segments
+
+    # Rake passes
+    for x in X_RAKE_POSITIONS:
+        segments.append((x, back_y, x, front_y))
+
+    return segments
+
+
+def _bbox_intersects_path(
+    min_x: float, max_x: float, min_y: float, max_y: float,
+    x1: float, y1: float, x2: float, y2: float,
+) -> bool:
+    """True if line segment (x1,y1)-(x2,y2) intersects axis-aligned box."""
+    # Vertical segment
+    if abs(x2 - x1) < 0.001:
+        return min_x <= x1 <= max_x and min_y <= min(y1, y2) <= max_y and max_y >= max(y1, y2)
+    # Horizontal segment
+    if abs(y2 - y1) < 0.001:
+        return min_y <= y1 <= max_y and min_x <= min(x1, x2) <= max_x and max_x >= max(x1, x2)
+    # General: check if either endpoint is inside, or line crosses edges
+    for x, y in [(x1, y1), (x2, y2)]:
+        if min_x <= x <= max_x and min_y <= y <= max_y:
+            return True
+    # Line crosses bbox - use Liang-Barsky or simple span check
+    x_lo, x_hi = min(x1, x2), max(x1, x2)
+    y_lo, y_hi = min(y1, y2), max(y1, y2)
+    if x_hi < min_x or x_lo > max_x or y_hi < min_y or y_lo > max_y:
+        return False
+    return True
+
+
+# Pusher path constants (match injector.py)
+X_POSITIONS_RAKE = (220, 190, 160, 130, 100, 70, 30)
+Y_BACK = 250.0
+Y_FRONT = 0.0
+X_CENTRAL = 125.0
+BED_X_MAX = 256.0
+BED_Y_MAX = 256.0
+
+
+def get_parts_from_3mf(path: str | Path) -> list[dict[str, float]]:
+    """
+    Extract per-part bounds from 3MF. Returns list of dicts with min_x, max_x, min_y, max_y,
+    min_z, max_z, center_x, back_y for each mesh object. Enables multi-part contact visualization.
+    """
+    if not TRIMESH_AVAILABLE:
+        return []
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        loaded = trimesh.load(str(path))
+        if loaded is None:
+            return []
+        parts: list[dict[str, float]] = []
+        if hasattr(loaded, "geometry"):
+            for _name, geom in loaded.geometry.items():
+                if hasattr(geom, "vertices"):
+                    vs = geom.vertices
+                    if len(vs) == 0:
+                        continue
+                    xs = [float(v[0]) for v in vs]
+                    ys = [float(v[1]) for v in vs]
+                    zs = [float(v[2]) for v in vs]
+                    mn_x, mx_x = min(xs), max(xs)
+                    mn_y, mx_y = min(ys), max(ys)
+                    mn_z, mx_z = min(zs), max(zs)
+                    parts.append({
+                        "min_x": mn_x, "max_x": mx_x,
+                        "min_y": mn_y, "max_y": mx_y,
+                        "min_z": mn_z, "max_z": mx_z,
+                        "center_x": (mn_x + mx_x) / 2,
+                        "back_y": mx_y,
+                    })
+        elif hasattr(loaded, "vertices"):
+            vs = loaded.vertices
+            xs = [float(v[0]) for v in vs]
+            ys = [float(v[1]) for v in vs]
+            zs = [float(v[2]) for v in vs]
+            mn_x, mx_x = min(xs), max(xs)
+            mn_y, mx_y = min(ys), max(ys)
+            mn_z, mx_z = min(zs), max(zs)
+            parts.append({
+                "min_x": mn_x, "max_x": mx_x,
+                "min_y": mn_y, "max_y": mx_y,
+                "min_z": mn_z, "max_z": mx_z,
+                "center_x": (mn_x + mx_x) / 2,
+                "back_y": mx_y,
+            })
+        return parts
+    except Exception:
+        return []
+
+
+def get_pusher_path_segments(
+    push_mode: str,
+    part_bounds: tuple[float, float] | None,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Return XY line segments (x1, y1, x2, y2) for the pusher path based on push mode.
+    Used to overlay pusher path on top-down view.
+    """
+    segments: list[tuple[float, float, float, float]] = []
+    cx, by = (part_bounds or (X_CENTRAL, Y_BACK))[0], (part_bounds or (X_CENTRAL, Y_BACK))[1]
+
+    if push_mode == "center_only":
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+    elif push_mode == "bump":
+        segments.append((cx, by, cx, Y_FRONT))
+        for x in X_POSITIONS_RAKE:
+            segments.append((x, Y_BACK, x, Y_FRONT))
+    else:
+        # center_and_sweep (default)
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+        for x in X_POSITIONS_RAKE:
+            segments.append((x, Y_BACK, x, Y_FRONT))
+    return segments
+
+
+def build_xy_footprint_at_z(
+    vertices: list[tuple[float, float, float]],
+    sweep_z: float,
+    z_tolerance: float = 2.0,
+) -> list[tuple[float, float]]:
+    """
+    Build XY footprint of part at sweep Z (vertices within z_tolerance of sweep_z).
+    Returns list of (x, y) points forming the contact cross-section outline.
+    Uses bins for a simple silhouette; empty list if no vertices at height.
+    """
+    if not vertices:
+        return []
+    near = [(v[0], v[1]) for v in vertices if abs(v[2] - sweep_z) <= z_tolerance]
+    if not near:
+        near = [(v[0], v[1]) for v in vertices if v[2] <= sweep_z]
+    if not near:
+        return []
+    xs, ys = [p[0] for p in near], [p[1] for p in near]
+    return [(min(xs), min(ys)), (max(xs), min(ys)), (max(xs), max(ys)), (min(xs), max(ys))]
+
+
+# Pusher path constants (match injector.py)
+Y_FRONT = 0.0
+Y_BACK = 250.0
+X_CENTRAL = 125.0
+X_POSITIONS = (220, 190, 160, 130, 100, 70, 30)
+BED_X_MIN, BED_X_MAX = 0.0, 256.0
+BED_Y_MIN, BED_Y_MAX = 0.0, 256.0
+
+
+def get_parts_from_3mf(path: str | Path) -> list[dict[str, float]] | None:
+    """
+    Extract per-part bounds from 3MF mesh. Returns list of dicts, each with
+    min_x, max_x, min_y, max_y, min_z, max_z, center_x, back_y.
+    Returns None if mesh unavailable (trimesh required).
+    """
+    if not TRIMESH_AVAILABLE:
         return None
-    xs = [v[0] for v in verts]
-    ys = [v[1] for v in verts]
-    center_x = (min(xs) + max(xs)) / 2
-    back_y = max(ys)  # Rear edge toward Y=250
-    return (center_x, back_y)
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        loaded = trimesh.load(str(path))
+        if loaded is None:
+            return None
+        parts: list[dict[str, float]] = []
+        if hasattr(loaded, "geometry"):
+            for _name, geom in loaded.geometry.items():
+                if hasattr(geom, "vertices"):
+                    verts = geom.vertices
+                    if len(verts) == 0:
+                        continue
+                    xs = [float(v[0]) for v in verts]
+                    ys = [float(v[1]) for v in verts]
+                    zs = [float(v[2]) for v in verts]
+                    mn_x, mx_x = min(xs), max(xs)
+                    mn_y, mx_y = min(ys), max(ys)
+                    mn_z, mx_z = min(zs), max(zs)
+                    parts.append({
+                        "min_x": mn_x, "max_x": mx_x,
+                        "min_y": mn_y, "max_y": mx_y,
+                        "min_z": mn_z, "max_z": mx_z,
+                        "center_x": (mn_x + mx_x) / 2,
+                        "back_y": mx_y,
+                    })
+        elif hasattr(loaded, "vertices"):
+            verts = loaded.vertices
+            if len(verts) > 0:
+                xs = [float(v[0]) for v in verts]
+                ys = [float(v[1]) for v in verts]
+                zs = [float(v[2]) for v in verts]
+                mn_x, mx_x = min(xs), max(xs)
+                mn_y, mx_y = min(ys), max(ys)
+                mn_z, mx_z = min(zs), max(zs)
+                parts.append({
+                    "min_x": mn_x, "max_x": mx_x,
+                    "min_y": mn_y, "max_y": mx_y,
+                    "min_z": mn_z, "max_z": mx_z,
+                    "center_x": (mn_x + mx_x) / 2,
+                    "back_y": mx_y,
+                })
+        return parts if parts else None
+    except Exception:
+        return None
+
+
+def get_pusher_path_segments(
+    push_mode: str,
+    part_bounds: tuple[float, float] | None = None,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Return list of (x1, y1, x2, y2) line segments for the pusher path in XY.
+    Used to draw the pusher path on the top-down view.
+    """
+    center_x = part_bounds[0] if part_bounds else X_CENTRAL
+    back_y = part_bounds[1] if part_bounds else Y_BACK
+    segments: list[tuple[float, float, float, float]] = []
+
+    if push_mode == "center_only":
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+        segments.append((X_CENTRAL, Y_FRONT, X_CENTRAL, Y_BACK))
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+    elif push_mode == "bump":
+        segments.append((center_x, back_y, center_x, Y_FRONT))
+        for x in X_POSITIONS:
+            segments.append((x, Y_BACK, x, Y_FRONT))
+    else:
+        # center_and_sweep (default)
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+        segments.append((X_CENTRAL, Y_FRONT, X_CENTRAL, Y_BACK))
+        segments.append((X_CENTRAL, Y_BACK, X_CENTRAL, Y_FRONT))
+        for x in X_POSITIONS:
+            segments.append((x, Y_BACK, x, Y_FRONT))
+
+    return segments
+
+
+def compute_contact_points(
+    parts: list[dict[str, float]],
+    sweep_z: float,
+    push_mode: str,
+    part_bounds: tuple[float, float] | None,
+) -> list[tuple[float, float]]:
+    """
+    Compute approximate contact points where the pusher (at sweep_z) hits each part.
+    Returns list of (x, y) points. A part is contacted if sweep_z is within [min_z, max_z]
+    and its XY footprint intersects the pusher path.
+    """
+    segments = get_pusher_path_segments(push_mode, part_bounds)
+    contacts: list[tuple[float, float]] = []
+
+    def segment_intersects_box(
+        x1: float, y1: float, x2: float, y2: float,
+        mn_x: float, mx_x: float, mn_y: float, mx_y: float,
+    ) -> tuple[float, float] | None:
+        """Return midpoint of intersection segment if vertical/horizontal line crosses box."""
+        if abs(x1 - x2) < 0.01:  # vertical line
+            if mn_x <= x1 <= mx_x:
+                overlap_y_lo = max(min(y1, y2), mn_y)
+                overlap_y_hi = min(max(y1, y2), mx_y)
+                if overlap_y_lo <= overlap_y_hi:
+                    return (x1, (overlap_y_lo + overlap_y_hi) / 2)
+        elif abs(y1 - y2) < 0.01:  # horizontal (not used for our path, but safe)
+            if mn_y <= y1 <= mx_y:
+                overlap_x_lo = max(min(x1, x2), mn_x)
+                overlap_x_hi = min(max(x1, x2), mx_x)
+                if overlap_x_lo <= overlap_x_hi:
+                    return ((overlap_x_lo + overlap_x_hi) / 2, y1)
+        return None
+
+    for part in parts:
+        if part["min_z"] > sweep_z or part["max_z"] < sweep_z:
+            continue
+        mn_x, mx_x = part["min_x"], part["max_x"]
+        mn_y, mx_y = part["min_y"], part["max_y"]
+        for x1, y1, x2, y2 in segments:
+            pt = segment_intersects_box(x1, y1, x2, y2, mn_x, mx_x, mn_y, mx_y)
+            if pt:
+                contacts.append(pt)
+                break
+
+    return contacts
+
+
+# Bed dimensions for preview (Bambu P1S)
+BED_X_MIN, BED_X_MAX = 0.0, 256.0
+BED_Y_MIN, BED_Y_MAX = 0.0, 256.0
+Y_FRONT, Y_BACK = 0.0, 250.0
+X_CENTRAL = 125.0
+X_RAKE_POSITIONS = (220, 190, 160, 130, 100, 70, 30)
+
+
+def get_parts_from_3mf(path: str | Path) -> list[dict[str, float]]:
+    """
+    Extract per-part bounds from 3MF mesh. Each part gets min_x, max_x, min_y, max_y, min_z, max_z.
+    Returns list of part bounds. Requires trimesh; returns [] for sliced .gcode.3mf with no mesh.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    if not TRIMESH_AVAILABLE:
+        return []
+    try:
+        loaded = trimesh.load(str(path))
+        if loaded is None:
+            return []
+        parts: list[dict[str, float]] = []
+        if hasattr(loaded, "geometry"):
+            for _name, geom in loaded.geometry.items():
+                if hasattr(geom, "vertices"):
+                    vs = geom.vertices
+                    if len(vs) == 0:
+                        continue
+                    xs = [float(v[0]) for v in vs]
+                    ys = [float(v[1]) for v in vs]
+                    zs = [float(v[2]) for v in vs]
+                    parts.append({
+                        "min_x": min(xs), "max_x": max(xs),
+                        "min_y": min(ys), "max_y": max(ys),
+                        "min_z": min(zs), "max_z": max(zs),
+                    })
+        elif hasattr(loaded, "vertices"):
+            vs = loaded.vertices
+            xs = [float(v[0]) for v in vs]
+            ys = [float(v[1]) for v in vs]
+            zs = [float(v[2]) for v in vs]
+            parts.append({
+                "min_x": min(xs), "max_x": max(xs),
+                "min_y": min(ys), "max_y": max(ys),
+                "min_z": min(zs), "max_z": max(zs),
+            })
+        return parts
+    except Exception:
+        return []
+
+
+def get_pusher_path_segments(
+    push_mode: str,
+    part_bounds: tuple[float, float] | None = None,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Return pusher path as list of (x1, y1, x2, y2) line segments in mm.
+    Used for top-down preview overlay.
+    """
+    y_front, y_back = Y_FRONT, Y_BACK
+    x_central = X_CENTRAL
+    x_positions = X_RAKE_POSITIONS
+    segments: list[tuple[float, float, float, float]] = []
+
+    if push_mode == "bump" and part_bounds:
+        center_x, back_y = part_bounds
+        segments.append((center_x, back_y, center_x, y_front))
+        for x in x_positions:
+            segments.append((x, y_back, x, y_front))
+        return segments
+
+    if push_mode == "center_only":
+        segments.append((x_central, y_back, x_central, y_front))
+        segments.append((x_central, y_back, x_central, y_front))
+        return segments
+
+    # center_and_sweep
+    segments.append((x_central, y_back, x_central, y_front))
+    segments.append((x_central, y_back, x_central, y_front))
+    for x in x_positions:
+        segments.append((x, y_back, x, y_front))
+    for x in x_positions:
+        segments.append((x, y_back, x, y_front))
+    return segments
 
 
 def compute_sweep_z(

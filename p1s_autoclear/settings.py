@@ -69,6 +69,7 @@ def settings_to_dict(
     cooldown_mode: str = "temp",
     cooldown_time: str = "180",
     cooldown_temp: str = "35",
+    cooldown_hold_seconds: str = "60",
     loop_count: str = "1",
     remove_purge: bool = False,
     fans_during_cooldown: bool = False,
@@ -82,12 +83,14 @@ def settings_to_dict(
     push_height_offset_mm: str = "20",
     bending_mode: str = "nhdfarm",
     push_mode: str = "center_and_sweep",
+    bed_level_interval: str = "0",
 ) -> dict[str, Any]:
     """Build a settings dict from GUI values for saving to disk or 3MF metadata."""
     return {
         "cooldown_mode": cooldown_mode,
         "cooldown_time": cooldown_time,
         "cooldown_temp": cooldown_temp,
+        "cooldown_hold_seconds": cooldown_hold_seconds,
         "loop_count": loop_count,
         "remove_purge_line": remove_purge,
         "fans_during_cooldown": fans_during_cooldown,
@@ -101,6 +104,7 @@ def settings_to_dict(
         "push_height_offset_mm": push_height_offset_mm,
         "bending_mode": bending_mode,
         "push_mode": push_mode,
+        "bed_level_interval": str(bed_level_interval).strip() if str(bed_level_interval).strip().isdigit() else "0",
     }
 
 
@@ -121,6 +125,8 @@ def autoclear_to_gui_settings(autoclear: dict[str, Any]) -> dict[str, Any]:
             out["cooldown_temp"] = str(int(v))
         else:
             out["cooldown_time"] = str(int(v))
+    if "cooldown_hold_seconds" in autoclear:
+        out["cooldown_hold_seconds"] = str(int(autoclear["cooldown_hold_seconds"]))
     # New NHDFARM params
     if "push_height_mode" in autoclear:
         out["push_height_mode"] = str(autoclear["push_height_mode"])
@@ -134,6 +140,8 @@ def autoclear_to_gui_settings(autoclear: dict[str, Any]) -> dict[str, Any]:
     if "push_mode" in autoclear:
         pm = str(autoclear["push_mode"])
         out["push_mode"] = "center_and_sweep" if pm not in ("center_only", "center_and_sweep", "bump") else pm
+    if "bed_level_interval" in autoclear:
+        out["bed_level_interval"] = str(int(autoclear["bed_level_interval"]))
     # Legacy migration: push_heights -> push_height_mode "auto" or manual with first value
     if "push_height_mode" not in out and "push_heights" in autoclear:
         ph = autoclear["push_heights"]
@@ -169,6 +177,7 @@ def apply_settings_to_gui(
     cooldown_mode_var,
     cooldown_time_var,
     cooldown_temp_var,
+    cooldown_hold_seconds_var=None,
     loop_count_var,
     remove_purge_var,
     fans_during_cooldown_var=None,
@@ -185,6 +194,7 @@ def apply_settings_to_gui(
     push_height_offset_var=None,
     bending_mode_var=None,
     push_mode_var=None,
+    bed_level_interval_var=None,
 ) -> None:
     """Apply a settings dict to GUI variables/widgets (StringVar, BooleanVar, Text).
     Updates cooldown, loop count, purge, push height, bending, template. Skips missing keys.
@@ -195,6 +205,8 @@ def apply_settings_to_gui(
         cooldown_time_var.set(str(data["cooldown_time"]))
     if "cooldown_temp" in data:
         cooldown_temp_var.set(str(data["cooldown_temp"]))
+    if cooldown_hold_seconds_var is not None and "cooldown_hold_seconds" in data:
+        cooldown_hold_seconds_var.set(str(int(data["cooldown_hold_seconds"])))
     if push_heights_var is not None and "push_heights" in data:
         push_heights_var.set(str(data["push_heights"]))
     if "loop_count" in data:
@@ -231,6 +243,8 @@ def apply_settings_to_gui(
     if push_mode_var is not None and "push_mode" in data:
         pm = str(data["push_mode"])
         push_mode_var.set("center_and_sweep" if pm not in ("center_only", "center_and_sweep", "bump") else pm)
+    if bed_level_interval_var is not None and "bed_level_interval" in data:
+        bed_level_interval_var.set(str(int(data["bed_level_interval"])))
     if template_text is not None and default_template:
         template_text.delete("1.0", "end")
         tpl = (data.get("template") or "").strip() if isinstance(data.get("template"), str) else ""
@@ -315,6 +329,7 @@ def delete_profile(name: str) -> bool:
 # Built-in default profiles for common filament types (NHDFARM-style)
 # All settings included so profiles fully override when loaded.
 _BUILTIN_BASE = {
+    "bed_level_interval": "0",
     "push_height_mode": "auto",
     "push_height_mm": "5",
     "push_height_offset_mm": "20",

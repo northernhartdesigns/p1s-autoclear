@@ -14,7 +14,7 @@ MIN_SWEEP_Z_MM = 5.0
 def build_cooldown_line(mode: str, value: float, temp_hold_seconds: float = 60) -> str:
     """Build cooldown G-code lines.
     mode 'time': outputs G4 P{ms} (value in seconds).
-    mode 'temp': outputs M190 S{temp} (wait for bed to cool to value °C), then G4 for temp_hold_seconds.
+    mode 'temp': outputs M190 S{temp} (wait for bed to cool to value °C; S used per FarmLoop/Bambu compatibility), then G4 for temp_hold_seconds.
     Returns empty string for unknown mode.
     """
     if mode == "time":
@@ -22,6 +22,7 @@ def build_cooldown_line(mode: str, value: float, temp_hold_seconds: float = 60) 
         ms = int(value * 1000)
         return f"G4 P{ms} ; cooldown {value}s"
     if mode == "temp":
+        # M190 S: Bambu-compatible; R may not be supported. FarmLoop uses M190 S for cooldown.
         lines = [f"M190 S{int(value)} ; wait for bed to cool to {int(value)}C"]
         if temp_hold_seconds > 0:
             lines.append(f"G4 P{int(temp_hold_seconds * 1000)} ; wait {int(temp_hold_seconds)}s before sweep")
@@ -68,13 +69,28 @@ def build_bump_block(
     back_y: float,
     z_expr: str,
     y_front: float = 0,
+    y_back: float = 250,
     speed_push: int = 3000,
+    speed_sweep: int = 3000,
+    speed_rake_fast: int = 12000,
+    x_positions: tuple[float, ...] = (220, 190, 160, 130, 100, 70, 30),
+    fans_off_after_first_push: str = "",
 ) -> str:
     """
-    Single targeted push at part center and back (bump mode).
-    Positions at (center_x, back_y), then one push forward to y_front.
+    Targeted bump at part center/back, then rake passes (same as center_and_sweep).
+    Positions at (center_x, back_y), one bump forward, then right-to-left rake (2 passes).
+    When fans_off_after_first_push is set, inserts it after the first bump (maximize cooldown).
     """
-    return "\n".join([
+
+    def rake_pass(speed: int) -> list[str]:
+        out = []
+        for x in x_positions:
+            out.append(f"G1 Y{y_back} F{speed}")
+            out.append(f"G1 X{x} F{speed}")
+            out.append(f"G1 Y{y_front} F{speed}")
+        return out
+
+    lines = [
         "; -------- choose sweep height ----------",
         f"G1 Z{z_expr} F10000",
         "M400",
@@ -83,7 +99,27 @@ def build_bump_block(
         f"G1 X{center_x:.1f} Y{back_y:.1f} F{speed_push}",
         f"G1 Y{y_front} F{speed_push}",
         "",
+    ]
+    if fans_off_after_first_push:
+        lines.append(fans_off_after_first_push)
+        lines.append("")
+    lines.extend([
+        "; -------- extended right-to-left rake (pass 1) --------",
+        *rake_pass(speed_sweep),
+        "",
+        "; ---------- choose sweep height ----------",
+        f"G1 Y{y_back} F{speed_sweep}",
+        "M400",
+        f"G1 X{x_positions[0]} F{speed_sweep}",
+        "M400",
+        "",
+        f"G1 Z{z_expr} F12000",
+        "M400",
+        "",
+        "; -------- extended right-to-left rake (pass 2) --------",
+        *rake_pass(speed_rake_fast),
     ])
+    return "\n".join(lines)
 
 
 def build_nhdfarm_sweep_block(  # noqa: D213
@@ -97,6 +133,7 @@ def build_nhdfarm_sweep_block(  # noqa: D213
     speed_rake_fast: int = 12000,
     x_positions: tuple[float, ...] = (220, 190, 160, 130, 100, 70, 30),
     x_central: float = 125,
+    fans_off_after_first_push: str = "",
 ) -> str:
     """
     NHDFARM-style sweep (mirror Auto-Clear): central sweeps + optional double rake pass.
@@ -132,6 +169,9 @@ def build_nhdfarm_sweep_block(  # noqa: D213
         f"G1 Y{y_front} F{speed_sweep}",
         "",
     ]
+    if fans_off_after_first_push:
+        lines.append(fans_off_after_first_push)
+        lines.append("")
 
     if push_mode == "center_and_sweep":
         lines.extend([
@@ -195,6 +235,7 @@ def build_injection_block_expanded(
     preheat_nozzle_temp: int = 150,
     loop_count: int = 1,
     *,
+    cooldown_hold_seconds: float = 60,
     part_bounds: tuple[float, float] | None = None,
 ) -> str:
     """
@@ -202,7 +243,7 @@ def build_injection_block_expanded(
     Same as build_injection_block but sweep Z is expanded (no placeholders).
     When push_mode is 'bump', uses part_bounds (center_x, back_y) from mesh; falls back to bed center if None.
     """
-    cooldown_line = build_cooldown_line(cooldown_mode, cooldown_value)
+    cooldown_line = build_cooldown_line(cooldown_mode, cooldown_value, temp_hold_seconds=cooldown_hold_seconds)
     if fans_during_cooldown:
         cooldown_line = (
             "M106 S255 ; part cooling 100%\n"
@@ -218,20 +259,36 @@ def build_injection_block_expanded(
             z_val = max(0.0, max_layer_z - offset)
         else:
             z_val = max(1.0, push_height_mm)
-        sweeps = build_bump_block(center_x=cx, back_y=cy, z_expr=f"{z_val:.2f}")
+        fans_off_blk = (
+            "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
+            if fans_during_cooldown
+            else ""
+        )
+        sweeps = build_bump_block(
+            center_x=cx, back_y=cy, z_expr=f"{z_val:.2f}",
+            fans_off_after_first_push=fans_off_blk,
+        )
     else:
+        fans_off_blk = (
+            "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
+            if fans_during_cooldown
+            else ""
+        )
         sweeps = build_nhdfarm_sweep_block_expanded(
             max_layer_z=max_layer_z,
             push_height_mode=push_height_mode,
             push_height_mm=push_height_mm,
             push_height_offset_mm=push_height_offset_mm,
             push_mode=push_mode,
+            fans_off_after_first_push=fans_off_blk,
         )
     template = template or DEFAULT_TEMPLATE
     if "{bending}" not in template and "{sweeps}" in template:
         template = template.replace("\n\n{sweeps}", "\n\n{bending}\n\n{sweeps}")
     if "{fans_off}" not in template:
         template = template.replace("; --- End Auto-Clear ---", "{fans_off}\n; --- End Auto-Clear ---")
+    if "{heaters_off}" not in template and "{fans_off}" in template:
+        template = template.replace("{fans_off}", "{heaters_off}\n{fans_off}")
     # Backward compat: inject fans_off_before_sweep and preheat if missing
     if "{fans_off_before_sweep}" not in template or "{preheat}" not in template:
         template = template.replace(
@@ -242,14 +299,16 @@ def build_injection_block_expanded(
     missing = [p for p in required if p not in template]
     if missing:
         raise ValueError(f"Template missing: {', '.join(missing)}")
-    fans_off_before_sweep = (
-        "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
-        if fans_during_cooldown
-        else ""
-    )
-    # Preheat is injected in wrap_plate_gcode_in_loops "Preparing for next loop" only
-    # (between loops 1..N-1), never after the last loop.
+    # Fans off is now embedded in sweeps (after first push) when fans_during_cooldown; keep template placeholder empty
+    fans_off_before_sweep = ""
+    # Preheat at sweep start: when reheat_between_loops and loop_count > 1, start heating during push
     preheat = ""
+    if reheat_between_loops and loop_count > 1:
+        preheat = (
+            f"M140 S{preheat_bed_temp} ; preheat bed for next print\n"
+            f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next print"
+        )
+    heaters_off = "M140 S0 ; bed off\nM104 S0 ; nozzle off"
     fans_off = (
         "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
         if fans_during_cooldown
@@ -261,6 +320,7 @@ def build_injection_block_expanded(
         sweeps=sweeps,
         fans_off_before_sweep=fans_off_before_sweep,
         preheat=preheat,
+        heaters_off=heaters_off,
         fans_off=fans_off,
     )
 
@@ -409,11 +469,12 @@ G90
 
 {sweeps}
 
-; End section (match Auto-Clear): safe corner XY park, then M17 S
+; End section (match Auto-Clear): safe corner XY park, heaters off, then M17 S
 G1 X65 Y245 F12000     ; move to safe corner before parking
 G1 Y265 F3000          ; final park at rear edge (idle position)
 
 M400
+{heaters_off}
 {fans_off}
 ; --- End Auto-Clear ---
 """
@@ -434,6 +495,7 @@ def build_injection_block(
     preheat_nozzle_temp: int = 150,
     loop_count: int = 1,
     *,
+    cooldown_hold_seconds: float = 60,
     push_heights: list[float] | None = None,
     use_plate_flex: bool | None = None,
     part_bounds: tuple[float, float] | None = None,
@@ -442,8 +504,11 @@ def build_injection_block(
     Build the full injection block from config.
     New params: push_height_mode, push_height_mm, bending_mode.
     Legacy params (push_heights, use_plate_flex) used for backward compat when new absent.
+    cooldown_hold_seconds: extra seconds to wait after bed reaches target temp (temp mode only).
     """
-    cooldown_line = build_cooldown_line(cooldown_mode, cooldown_value)
+    cooldown_line = build_cooldown_line(
+        cooldown_mode, cooldown_value, temp_hold_seconds=cooldown_hold_seconds
+    )
     if fans_during_cooldown:
         cooldown_line = (
             "M106 S255 ; part cooling 100%\n"
@@ -472,13 +537,25 @@ def build_injection_block(
                 z_expr = f"{{max(1, max_layer_z - {offset})}}"
             else:
                 z_expr = str(max(1.0, push_height_mm))
-            sweeps = build_bump_block(center_x=cx, back_y=cy, z_expr=z_expr)
+            fans_off_blk = (
+                "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
+                if fans_during_cooldown else ""
+            )
+            sweeps = build_bump_block(
+                center_x=cx, back_y=cy, z_expr=z_expr,
+                fans_off_after_first_push=fans_off_blk,
+            )
         else:
+            fans_off_blk = (
+                "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
+                if fans_during_cooldown else ""
+            )
             sweeps = build_nhdfarm_sweep_block(
                 push_height_mode=push_height_mode,
                 push_height_mm=push_height_mm,
                 push_height_offset_mm=push_height_offset_mm,
                 push_mode=push_mode,
+                fans_off_after_first_push=fans_off_blk,
             )
     template = template or DEFAULT_TEMPLATE
     # Backward compat: old templates use {plate_flex}, new use {bending}
@@ -488,6 +565,8 @@ def build_injection_block(
         template = template.replace("\n\n{sweeps}", "\n\n{bending}\n\n{sweeps}")
     if "{fans_off}" not in template:
         template = template.replace("; --- End Auto-Clear ---", "{fans_off}\n; --- End Auto-Clear ---")
+    if "{heaters_off}" not in template and "{fans_off}" in template:
+        template = template.replace("{fans_off}", "{heaters_off}\n{fans_off}")
     # Backward compat: inject fans_off_before_sweep and preheat if missing
     if "{fans_off_before_sweep}" not in template or "{preheat}" not in template:
         template = template.replace(
@@ -498,14 +577,16 @@ def build_injection_block(
     missing = [p for p in required if p not in template]
     if missing:
         raise ValueError(f"G-code template missing required placeholder(s): {', '.join(missing)}")
-    fans_off_before_sweep = (
-        "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
-        if fans_during_cooldown
-        else ""
-    )
-    # Preheat is injected in wrap_plate_gcode_in_loops "Preparing for next loop" only
-    # (between loops 1..N-1), never after the last loop.
+    # Fans off now embedded in sweeps (after first push) when fans_during_cooldown.
+    fans_off_before_sweep = ""
+    # Preheat at sweep start: when reheat_between_loops and loop_count > 1, start heating during push
     preheat = ""
+    if reheat_between_loops and loop_count > 1:
+        preheat = (
+            f"M140 S{preheat_bed_temp} ; preheat bed for next print\n"
+            f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next print"
+        )
+    heaters_off = "M140 S0 ; bed off\nM104 S0 ; nozzle off"
     fans_off = (
         "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
         if fans_during_cooldown
@@ -517,6 +598,7 @@ def build_injection_block(
         "sweeps": sweeps,
         "fans_off_before_sweep": fans_off_before_sweep,
         "preheat": preheat,
+        "heaters_off": heaters_off,
         "fans_off": fans_off,
     }
     return template.strip().format(**fmt)

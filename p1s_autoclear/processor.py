@@ -61,6 +61,7 @@ def process_3mf(
     reheat_between_loops: bool = False,
     preheat_bed_temp: int = 70,
     preheat_nozzle_temp: int = 150,
+    cooldown_hold_seconds: float = 60,
     *,
     push_height_mode: str = "auto",
     push_height_mm: float = 5.0,
@@ -69,6 +70,7 @@ def process_3mf(
     push_mode: str = "center_and_sweep",
     push_heights: list[float] | None = None,
     use_plate_flex: bool | None = None,
+    bed_level_interval: int = 0,
 ) -> str:
     """
     Load 3MF, inject NHDFARM-style auto-clear block into machine_end_gcode, save to output.
@@ -113,6 +115,7 @@ def process_3mf(
             loop_count=loop_count,
             push_heights=push_heights,
             use_plate_flex=use_plate_flex if use_plate_flex is not None else False,
+            cooldown_hold_seconds=cooldown_hold_seconds,
         )
     else:
         block = build_injection_block(
@@ -130,6 +133,7 @@ def process_3mf(
             preheat_nozzle_temp=preheat_nozzle_temp,
             loop_count=loop_count,
             part_bounds=part_bounds,
+            cooldown_hold_seconds=cooldown_hold_seconds,
         )
 
     with zipfile.ZipFile(input_path, "r") as zf_in:
@@ -194,6 +198,7 @@ def process_3mf(
                         preheat_nozzle_temp=preheat_nozzle_temp,
                         loop_count=loop_count,
                         part_bounds=part_bounds,
+                        cooldown_hold_seconds=cooldown_hold_seconds,
                     )
                     gcode = inject_autoclear_into_plate_gcode(gcode, plate_block)
             if remove_purge_line:
@@ -218,8 +223,10 @@ def process_3mf(
     # Write full autoclear settings to 3MF (stored in file for reload)
     autoclear_settings = {
         "loop_count": loop_count,
+        "bed_level_interval": max(0, bed_level_interval),
         "cooldown_mode": cooldown_mode,
         "cooldown_value": cooldown_value,
+        "cooldown_hold_seconds": cooldown_hold_seconds,
         "remove_purge_line": remove_purge_line,
         "fans_during_cooldown": fans_during_cooldown,
         "skip_retraction_between_loops": skip_retraction_between_loops,

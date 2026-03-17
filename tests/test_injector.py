@@ -115,7 +115,8 @@ def test_build_injection_block_bump_mode():
     assert "targeted bump" in result
     assert "G1 X60.0 Y120.0" in result
     assert "G1 Y0" in result
-    assert "rake" not in result
+    assert "rake (pass 1)" in result
+    assert "rake (pass 2)" in result
 
 
 def test_build_injection_block_has_xy_park():
@@ -164,7 +165,7 @@ def test_build_injection_block_fans_during_cooldown_true():
 
 
 def test_build_injection_block_fans_off_at_end():
-    """When fans_during_cooldown=True, fans are turned off before sweep and at end of sequence."""
+    """When fans_during_cooldown=True, fans are turned off after first push and at end of sequence."""
     result = build_injection_block(
         cooldown_mode="temp",
         cooldown_value=40,
@@ -192,8 +193,8 @@ def test_build_injection_block_fans_during_cooldown_false():
     assert "M190 S40" in result
 
 
-def test_build_injection_block_fans_off_before_sweep():
-    """When fans_during_cooldown=True, M107 appears before sweep block (fans off before sweep)."""
+def test_build_injection_block_fans_off_after_first_push():
+    """When fans_during_cooldown=True, M107 appears after central sweeps, before rake (maximize cooldown)."""
     result = build_injection_block(
         cooldown_mode="temp",
         cooldown_value=40,
@@ -201,9 +202,13 @@ def test_build_injection_block_fans_off_before_sweep():
         bending_mode="nhdfarm",
         fans_during_cooldown=True,
     )
-    # First M107 block (fans_off_before_sweep) must appear before sweep height / central sweeps
-    sweep_marker = "; -------- choose sweep height ----------"
-    assert result.index("M107") < result.index(sweep_marker)
+    # M107 (fans off) must appear after central sweeps, before rake pass 1
+    central_sweeps_end = "G1 Y0 F3000\n\nM107"
+    rake_marker = "; -------- extended right-to-left rake (pass 1) --------"
+    assert central_sweeps_end in result
+    first_m107 = result.index("M107")
+    assert first_m107 > result.index("; -------- central sweeps (2) --------")
+    assert first_m107 < result.index(rake_marker)
 
 
 def test_build_injection_block_reheat_between_loops_true_loop_count_2():
@@ -219,13 +224,15 @@ def test_build_injection_block_reheat_between_loops_true_loop_count_2():
         preheat_nozzle_temp=220,
         loop_count=2,
     )
-    # Preheat moved to wrap's "Preparing for next loop" (between loops, not after last)
-    assert "M140 S" not in result
-    assert "M104 S" not in result
+    # Preheat at sweep start when reheat + loop_count > 1; heaters off at end always
+    assert "M140 S60" in result  # preheat bed
+    assert "M104 S220" in result  # preheat nozzle
+    assert "M140 S0" in result  # heaters off at end
+    assert "M104 S0" in result
 
 
 def test_build_injection_block_reheat_between_loops_true_loop_count_1():
-    """When reheat_between_loops=True and loop_count=1, no M140/M104 (no next loop)."""
+    """When reheat_between_loops=True and loop_count=1, no preheat (single print) but heaters off."""
     result = build_injection_block(
         cooldown_mode="temp",
         cooldown_value=40,
@@ -237,12 +244,14 @@ def test_build_injection_block_reheat_between_loops_true_loop_count_1():
         preheat_nozzle_temp=220,
         loop_count=1,
     )
-    assert "M140 S" not in result
-    assert "M104 S" not in result
+    assert "M140 S60" not in result  # no preheat for single print
+    assert "M104 S220" not in result
+    assert "M140 S0" in result  # heaters off at end
+    assert "M104 S0" in result
 
 
 def test_build_injection_block_reheat_between_loops_false():
-    """When reheat_between_loops=False, no preheat commands."""
+    """When reheat_between_loops=False, no preheat but heaters off at end."""
     result = build_injection_block(
         cooldown_mode="temp",
         cooldown_value=40,
@@ -252,8 +261,10 @@ def test_build_injection_block_reheat_between_loops_false():
         reheat_between_loops=False,
         loop_count=2,
     )
-    assert "M140 S" not in result
-    assert "M104 S" not in result
+    assert "M140 S70" not in result  # no preheat
+    assert "M104 S150" not in result
+    assert "M140 S0" in result  # heaters off
+    assert "M104 S0" in result
 
 
 def test_build_injection_block_missing_placeholder():

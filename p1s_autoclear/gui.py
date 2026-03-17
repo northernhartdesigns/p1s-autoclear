@@ -123,7 +123,9 @@ def create_gui() -> tk.Tk:
     cooldown_mode_var = tk.StringVar(value="temp")
     cooldown_time_var = tk.StringVar(value="180")
     cooldown_temp_var = tk.StringVar(value="35")
+    cooldown_hold_seconds_var = tk.StringVar(value="60")
     loop_count_var = tk.StringVar(value="1")
+    bed_level_interval_var = tk.StringVar(value="0")
     remove_purge_var = tk.BooleanVar(value=False)
     fans_during_cooldown_var = tk.BooleanVar(value=False)
     skip_retraction_between_loops_var = tk.BooleanVar(value=True)
@@ -142,6 +144,7 @@ def create_gui() -> tk.Tk:
     default_export_path_var = tk.StringVar(value="")
     open_export_folder_var = tk.BooleanVar(value=False)
     default_import_path_var = tk.StringVar(value="")
+    version_override_var = tk.StringVar(value="(use detected)")
 
     # Main layout
     main = ttk.Frame(root, padding=(10, 10, 10, 10))
@@ -187,12 +190,14 @@ def create_gui() -> tk.Tk:
                             cooldown_mode_var=cooldown_mode_var,
                             cooldown_time_var=cooldown_time_var,
                             cooldown_temp_var=cooldown_temp_var,
+                            cooldown_hold_seconds_var=cooldown_hold_seconds_var,
                             push_height_mode_var=push_height_mode_var,
                             push_height_mm_var=push_height_mm_var,
                             push_height_offset_var=push_height_offset_var,
                             bending_mode_var=bending_mode_var,
                             push_mode_var=push_mode_var,
                             loop_count_var=loop_count_var,
+                            bed_level_interval_var=bed_level_interval_var,
                             remove_purge_var=remove_purge_var,
                             skip_retraction_between_loops_var=skip_retraction_between_loops_var,
                             fans_during_cooldown_var=fans_during_cooldown_var,
@@ -235,15 +240,21 @@ def create_gui() -> tk.Tk:
     temp_row.pack(fill=tk.X, padx=(16, 0))
     ttk.Label(temp_row, text="Bed:").pack(side=tk.LEFT, padx=(0, 4))
     ttk.Entry(temp_row, textvariable=cooldown_temp_var, width=6).pack(side=tk.LEFT)
+    hold_row = ttk.Frame(cool_frame)
+    hold_row.pack(fill=tk.X, padx=(16, 0), pady=(4, 0))
+    ttk.Label(hold_row, text="Extra hold (sec):").pack(side=tk.LEFT, padx=(0, 4))
+    hold_entry = ttk.Entry(hold_row, textvariable=cooldown_hold_seconds_var, width=6)
+    hold_entry.pack(side=tk.LEFT)
+    _create_tooltip(hold_entry, "When using temp-based cooldown: extra seconds to wait after bed reaches target temp before sweep. Default 60.")
     fans_cb = ttk.Checkbutton(
         cool_frame,
         text="Fans 100% during cooldown",
         variable=fans_during_cooldown_var,
     )
     fans_cb.pack(anchor=tk.W, pady=(4, 0))
-    _create_tooltip(fans_cb, "Runs all fans (part cooling, auxiliary, chamber) at 100% during cooldown to speed up bed cooling.")
+    _create_tooltip(fans_cb, "Runs all fans at 100% during cooldown, bending, and first push; fans turn off after first push to maximize cooldown.")
 
-    # Settings (Loop count + Skip purge + Skip bed leveling)
+    # Settings (Loop count + Bed level interval + Skip purge)
     settings_frame = ttk.LabelFrame(top_row, text="Settings", padding=2)
     settings_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True)
     loop_row = ttk.Frame(settings_frame)
@@ -251,6 +262,12 @@ def create_gui() -> tk.Tk:
     ttk.Label(loop_row, text="Loops:").pack(side=tk.LEFT, padx=(0, 4))
     ttk.Entry(loop_row, textvariable=loop_count_var, width=4).pack(side=tk.LEFT)
     ttk.Label(settings_frame, text="(1 = single print)", font=("", 8)).pack(anchor=tk.W)
+    bed_level_row = ttk.Frame(settings_frame)
+    bed_level_row.pack(fill=tk.X)
+    ttk.Label(bed_level_row, text="Bed level every:").pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Entry(bed_level_row, textvariable=bed_level_interval_var, width=4).pack(side=tk.LEFT)
+    ttk.Label(bed_level_row, text="loops (0=first only)", font=("", 8)).pack(side=tk.LEFT, padx=(4, 0))
+    _create_tooltip(bed_level_row, "For run_loop: bed leveling on loop 1 and every N loops. 0 = first loop only. Saves ~5 min per loop when skipped.")
     purge_cb = ttk.Checkbutton(
         settings_frame,
         text="Skip nozzle load line",
@@ -462,7 +479,7 @@ def create_gui() -> tk.Tk:
     def _schedule_refresh(*_a):
         root.after(50, refresh_preview)
 
-    for var in (push_height_mode_var, push_height_mm_var, push_height_offset_var, auto_sweep_z_var):
+    for var in (push_height_mode_var, push_height_mm_var, push_height_offset_var, auto_sweep_z_var, push_mode_var):
         var.trace_add("write", _schedule_refresh)
     def clamp_manual_height(*_):
         try:
@@ -509,12 +526,14 @@ def create_gui() -> tk.Tk:
                 cooldown_mode_var=cooldown_mode_var,
                 cooldown_time_var=cooldown_time_var,
                 cooldown_temp_var=cooldown_temp_var,
+                cooldown_hold_seconds_var=cooldown_hold_seconds_var,
                 push_height_mode_var=push_height_mode_var,
                 push_height_mm_var=push_height_mm_var,
                 push_height_offset_var=push_height_offset_var,
                 bending_mode_var=bending_mode_var,
                 push_mode_var=push_mode_var,
                 loop_count_var=loop_count_var,
+                bed_level_interval_var=bed_level_interval_var,
                 remove_purge_var=remove_purge_var,
                 fans_during_cooldown_var=fans_during_cooldown_var,
                 skip_retraction_between_loops_var=skip_retraction_between_loops_var,
@@ -531,11 +550,13 @@ def create_gui() -> tk.Tk:
             cooldown_mode=cooldown_mode_var.get(),
             cooldown_time=cooldown_time_var.get().strip(),
             cooldown_temp=cooldown_temp_var.get().strip(),
+            cooldown_hold_seconds=cooldown_hold_seconds_var.get().strip(),
             push_height_mode=push_height_mode_var.get(),
             push_height_mm=push_height_mm_var.get().strip(),
             push_height_offset_mm=push_height_offset_var.get().strip(),
             push_mode=push_mode_var.get(),
             loop_count=loop_count_var.get().strip(),
+            bed_level_interval=bed_level_interval_var.get().strip(),
             remove_purge=remove_purge_var.get(),
             fans_during_cooldown=fans_during_cooldown_var.get(),
             skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
@@ -618,6 +639,31 @@ def create_gui() -> tk.Tk:
 
     settings_scroll = ttk.Frame(settings_tab, padding=(4, 0))
     settings_scroll.pack(fill=tk.BOTH, expand=True)
+
+    # Version section
+    version_frame = ttk.LabelFrame(settings_scroll, text="Version", padding=8)
+    version_frame.pack(fill=tk.X, pady=(0, 8))
+    ttk.Label(version_frame, text=f"Detected: v{__version__}").pack(anchor=tk.W)
+    ver_row = ttk.Frame(version_frame)
+    ver_row.pack(fill=tk.X, pady=(4, 0))
+    ttk.Label(ver_row, text="Display as:").pack(side=tk.LEFT, padx=(0, 6))
+    version_combo = ttk.Combobox(
+        ver_row,
+        textvariable=version_override_var,
+        values=("(use detected)", "0.1.0", "0.2.0", "dev"),
+        width=16,
+        state="readonly",
+    )
+    version_combo.pack(side=tk.LEFT)
+    version_combo.set("(use detected)")  # Default before app config load
+    _create_tooltip(version_combo, "Override the version shown in the window title. Useful for testing or compatibility.")
+
+    def _update_title(*_):
+        v = version_override_var.get().strip()
+        disp = v if v and v != "(use detected)" else __version__
+        root.title(f"P1S Auto-Clear v{disp} - NHDFARM-Style G-code Injector")
+    version_override_var.trace_add("write", _update_title)
+
     exp_frame = ttk.LabelFrame(settings_scroll, text="Export", padding=8)
     exp_frame.pack(fill=tk.X, pady=(0, 8))
     exp_row = ttk.Frame(exp_frame)
@@ -644,12 +690,13 @@ def create_gui() -> tk.Tk:
     # Load last-used settings on startup
     last = load_last_settings()
     if last:
-        apply_settings_to_gui(
-            last,
-            cooldown_mode_var=cooldown_mode_var,
-            cooldown_time_var=cooldown_time_var,
-            cooldown_temp_var=cooldown_temp_var,
-            push_height_mode_var=push_height_mode_var,
+            apply_settings_to_gui(
+                last,
+                cooldown_mode_var=cooldown_mode_var,
+                cooldown_time_var=cooldown_time_var,
+                cooldown_temp_var=cooldown_temp_var,
+                cooldown_hold_seconds_var=cooldown_hold_seconds_var,
+                push_height_mode_var=push_height_mode_var,
             push_height_mm_var=push_height_mm_var,
             push_height_offset_var=push_height_offset_var,
             bending_mode_var=bending_mode_var,
@@ -675,6 +722,9 @@ def create_gui() -> tk.Tk:
             open_export_folder_var.set(bool(app_cfg["open_export_folder_after_export"]))
         if "default_import_path" in app_cfg and app_cfg["default_import_path"]:
             default_import_path_var.set(str(app_cfg["default_import_path"]))
+        if "version_override" in app_cfg and app_cfg["version_override"]:
+            version_override_var.set(str(app_cfg["version_override"]))
+    _update_title()  # Apply version to title after config load
 
     # --- Buttons (btn_frame already created and packed at bottom, above) ---
     def _open_folder_in_explorer(folder_path: Path) -> None:
@@ -734,6 +784,12 @@ def create_gui() -> tk.Tk:
         except (ValueError, AttributeError):
             loop_count = 1
 
+        try:
+            cooldown_hold = float(cooldown_hold_seconds_var.get().strip())
+            cooldown_hold = max(0, min(600, cooldown_hold))
+        except (ValueError, AttributeError):
+            cooldown_hold = 60.0
+
         stem = path.stem
         if stem.endswith(".gcode"):
             stem = Path(stem).stem
@@ -783,12 +839,14 @@ def create_gui() -> tk.Tk:
                 push_mode=push_mode_var.get(),
                 template=template,
                 loop_count=loop_count,
+                bed_level_interval=max(0, int(bed_level_interval_var.get().strip() or "0")),
                 remove_purge_line=remove_purge_var.get(),
                 fans_during_cooldown=fans_during_cooldown_var.get(),
                 skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
                 reheat_between_loops=reheat_between_loops_var.get(),
                 preheat_bed_temp=preheat_bed,
                 preheat_nozzle_temp=preheat_nozzle,
+                cooldown_hold_seconds=cooldown_hold,
             )
             messagebox.showinfo("Success", f"Exported to:\n{result}")
             if open_export_folder_var.get():
@@ -797,12 +855,14 @@ def create_gui() -> tk.Tk:
                 cooldown_mode=cooldown_mode,
                 cooldown_time=cooldown_time_var.get().strip(),
                 cooldown_temp=cooldown_temp_var.get().strip(),
+                cooldown_hold_seconds=cooldown_hold_seconds_var.get().strip(),
                 push_height_mode=push_height_mode,
                 push_height_mm=push_height_mm_var.get().strip(),
                 push_height_offset_mm=push_height_offset_var.get().strip(),
                 bending_mode="nhdfarm" if bending_mode_var.get() == "on" else "none",
                 push_mode=push_mode_var.get(),
                 loop_count=str(loop_count),
+                bed_level_interval=bed_level_interval_var.get().strip(),
                 remove_purge=remove_purge_var.get(),
                 fans_during_cooldown=fans_during_cooldown_var.get(),
                 skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
@@ -856,8 +916,10 @@ COOLDOWN
 • Time (sec): Wait a fixed number of seconds before pushing (G4).
 • Temp (°C): Wait until bed cools to the given temperature (M190).
   Use temp-based cooldown (e.g. 40°C) for more reliable detachment.
-• Fans 100% during cooldown: Runs all fans (part cooling, auxiliary, chamber)
-  at 100% (M106 S255, P2, P3) during cooldown to speed up bed cooling.
+• Fans 100% during cooldown: Runs all fans at 100% during cooldown, bending,
+  and the first push; fans turn off after the first push to maximize cooldown.
+• Extra cooldown hold (sec): When using temp-based cooldown, extra seconds to
+  wait after the bed reaches target temp before starting the sweep. Default 60.
 
 LOOP COUNT
 ---------
@@ -986,6 +1048,7 @@ Open in Bambu Studio, slice, and print. For looping, use:
             cooldown_mode=cooldown_mode_var.get(),
             cooldown_time=cooldown_time_var.get().strip(),
             cooldown_temp=cooldown_temp_var.get().strip(),
+            cooldown_hold_seconds=cooldown_hold_seconds_var.get().strip(),
             push_height_mode=push_height_mode_var.get(),
             push_height_mm=push_height_mm_var.get().strip(),
             push_height_offset_mm=push_height_offset_var.get().strip(),
@@ -1000,10 +1063,12 @@ Open in Bambu Studio, slice, and print. For looping, use:
             preheat_nozzle_temp=preheat_nozzle_temp_var.get().strip(),
             template=template_text.get("1.0", tk.END).strip(),
         ))
+        vov = version_override_var.get().strip()
         save_app_config({
             "default_export_path": default_export_path_var.get().strip(),
             "open_export_folder_after_export": open_export_folder_var.get(),
             "default_import_path": default_import_path_var.get().strip(),
+            "version_override": vov if vov and vov != "(use detected)" else "",
         })
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_closing)

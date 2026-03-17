@@ -1,0 +1,6 @@
+# P1S Auto-Clear - dependencies
+# Install: pip install -r requirements.txt
+# (run from the p1s-autoclear folder)
+
+# Editable install with preview (bump mode) and run-loop
+-e ".[preview,run_loop]"

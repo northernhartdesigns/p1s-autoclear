@@ -24,12 +24,23 @@ NHDFARM-style G-code injection for Bambu Lab P1S (and P1P/X1C) automation. Injec
 
 ## Installation
 
+**Auto-install (recommended):**
+- **Windows**: Double-click `install.bat`
+- **Linux/Mac**: `./install.sh` or `bash install.sh`
+
+**Manual install:**
+```bash
+cd p1s-autoclear
+pip install -r requirements.txt
+```
+
+**Minimal (no preview/run-loop):**
 ```bash
 cd p1s-autoclear
 pip install -e .
 ```
 
-Or run directly without installing:
+Or run directly without installing (bump mode requires `pip install trimesh`):
 
 ```bash
 cd p1s-autoclear
