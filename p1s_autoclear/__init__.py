@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from .merge_3mf import merge_3mf_files
+
 
 def get_sacrificial_3mf_path() -> Path:
     """Path to the sacrificial 3MF, used to avoid Bambu Studio File Open crash.
@@ -18,3 +20,5 @@ def _get_version() -> str:
 
 
 __version__ = _get_version()
+
+__all__ = ["merge_3mf_files", "get_sacrificial_3mf_path", "__version__"]

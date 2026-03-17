@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-file merge**: Add multiple 3MF files to the GUI, configure per-file settings (cooldown, loops, etc.), and export a single merged 3MF with per-plate auto-clear settings
+- **Per-plate settings**: `plate_settings` in 3MF metadata for different cooldown/loop counts per plate in merged files
+- **Run Loop multi-plate**: `run_loop` detects multiple plates in a 3MF and prints each in sequence, honoring per-plate loop counts
 - **Bump push mode**: single targeted push at part center and back (from mesh). Uses `get_part_bounds_from_3mf` (requires trimesh `[preview]`). Falls back to bed center when mesh unavailable.
 - Last-used settings: app remembers cooldown, push heights, purge line, template, loop count
 - Filament profiles: save/load presets (PLA, PETG, ABS/ASA + custom)

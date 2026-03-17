@@ -5,6 +5,7 @@ GUI for P1S Auto-Clear: load 3MF, configure cooldown/push heights, export.
 import os
 import platform
 import subprocess
+import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
@@ -16,6 +17,7 @@ from .preview import (
     draw_preview_on_canvas,
     get_max_z_from_3mf,
 )
+from .merge_3mf import merge_3mf_files
 from .processor import get_autoclear_settings, process_3mf
 from .settings import (
     BUILTIN_PROFILES,
@@ -164,52 +166,173 @@ def create_gui() -> tk.Tk:
     settings_tab = ttk.Frame(notebook, padding=(4, 8))
     notebook.add(settings_tab, text="Settings")
 
-    # --- File section ---
-    file_frame = ttk.LabelFrame(main_tab, text="3MF File", padding=8)
+    # --- File section (supports single or multiple 3MF files) ---
+    file_frame = ttk.LabelFrame(main_tab, text="3MF Files", padding=8)
     file_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
     main_tab.columnconfigure(0, weight=1)
 
-    ttk.Entry(file_frame, textvariable=input_path_var, width=42).pack(
-        side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5)
-    )
+    file_list_data: list[dict] = []  # [{"path": str, "settings": dict}, ...]
 
-    def load_file():
+    list_container = ttk.Frame(file_frame)
+    list_container.pack(fill=tk.BOTH, expand=True)
+    file_listbox = tk.Listbox(
+        list_container,
+        height=3,
+        selectmode=tk.EXTENDED,
+        font=("Segoe UI", 9),
+        bg=_BAMBU_ENTRY_BG,
+        fg=_BAMBU_FG,
+        selectbackground=_BAMBU_ACCENT,
+        selectforeground=_BAMBU_FG,
+    )
+    file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+    list_scroll = ttk.Scrollbar(list_container, command=file_listbox.yview)
+    list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    file_listbox.configure(yscrollcommand=list_scroll.set)
+
+    def _refresh_file_list_ui():
+        file_listbox.delete(0, tk.END)
+        for item in file_list_data:
+            p = Path(item["path"])
+            file_listbox.insert(tk.END, p.name)
+        if file_list_data:
+            input_path_var.set(file_list_data[0]["path"])
+
+    def _dict_from_gui_for_file() -> dict:
+        """Build settings dict from current main form vars (for single-file or defaults)."""
+        cooldown_mode = cooldown_mode_var.get()
+        return settings_to_dict(
+            cooldown_mode=cooldown_mode,
+            cooldown_time=cooldown_time_var.get().strip(),
+            cooldown_temp=cooldown_temp_var.get().strip(),
+            cooldown_hold_seconds=cooldown_hold_seconds_var.get().strip(),
+            loop_count=loop_count_var.get().strip(),
+            bed_level_interval=bed_level_interval_var.get().strip(),
+            remove_purge=remove_purge_var.get(),
+            fans_during_cooldown=fans_during_cooldown_var.get(),
+            skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
+            reheat_between_loops=reheat_between_loops_var.get(),
+            preheat_bed_temp=preheat_bed_temp_var.get().strip(),
+            preheat_nozzle_temp=preheat_nozzle_temp_var.get().strip(),
+            template=template_text.get("1.0", tk.END).strip(),
+            push_height_mode=push_height_mode_var.get(),
+            push_height_mm=push_height_mm_var.get().strip(),
+            push_height_offset_mm=push_height_offset_var.get().strip(),
+            bending_mode=bending_mode_var.get(),
+            push_mode=push_mode_var.get(),
+        )
+
+    def _show_file_settings_dialog(idx: int) -> None:
+        """Open per-file settings dialog for the file at index."""
+        if idx < 0 or idx >= len(file_list_data):
+            return
+        item = file_list_data[idx]
+        dlg = tk.Toplevel(root)
+        dlg.title(f"Settings for {Path(item['path']).name}")
+        dlg.transient(root)
+        dlg.grab_set()
+        dlg.geometry("320x280")
+        dlg.configure(bg=_BAMBU_BG)
+
+        bm = item["settings"].get("bending_mode", "nhdfarm")
+        if str(bm).lower() in ("nhdfarm", "farmloop"):
+            bm = "on"
+        elif str(bm).lower() in ("none", "off"):
+            bm = "off"
+        vars_d = {
+            "cooldown_mode": tk.StringVar(value=item["settings"].get("cooldown_mode", "temp")),
+            "cooldown_time": tk.StringVar(value=str(item["settings"].get("cooldown_time", "180"))),
+            "cooldown_temp": tk.StringVar(value=str(item["settings"].get("cooldown_temp", "35"))),
+            "cooldown_hold_seconds": tk.StringVar(value=str(item["settings"].get("cooldown_hold_seconds", "60"))),
+            "loop_count": tk.StringVar(value=str(item["settings"].get("loop_count", "1"))),
+            "bed_level_interval": tk.StringVar(value=str(item["settings"].get("bed_level_interval", "0"))),
+            "remove_purge": tk.BooleanVar(value=item["settings"].get("remove_purge_line", False)),
+            "fans_during_cooldown": tk.BooleanVar(value=item["settings"].get("fans_during_cooldown", False)),
+            "skip_retraction_between_loops": tk.BooleanVar(value=item["settings"].get("skip_retraction_between_loops", True)),
+            "reheat_between_loops": tk.BooleanVar(value=item["settings"].get("reheat_between_loops", False)),
+            "preheat_bed_temp": tk.StringVar(value=str(item["settings"].get("preheat_bed_temp", "70"))),
+            "preheat_nozzle_temp": tk.StringVar(value=str(item["settings"].get("preheat_nozzle_temp", "150"))),
+            "push_height_mode": tk.StringVar(value=item["settings"].get("push_height_mode", "auto")),
+            "push_height_mm": tk.StringVar(value=str(item["settings"].get("push_height_mm", "5"))),
+            "push_height_offset_mm": tk.StringVar(value=str(item["settings"].get("push_height_offset_mm", "20"))),
+            "bending_mode": tk.StringVar(value=bm),
+            "push_mode": tk.StringVar(value=item["settings"].get("push_mode", "center_and_sweep")),
+        }
+
+        f = ttk.Frame(dlg, padding=8)
+        f.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(f, text="Loops:").grid(row=0, column=0, sticky=tk.W, padx=(0, 4), pady=2)
+        ttk.Entry(f, textvariable=vars_d["loop_count"], width=6).grid(row=0, column=1, sticky=tk.W, pady=2)
+        ttk.Radiobutton(f, text="Time (sec)", variable=vars_d["cooldown_mode"], value="time").grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        ttk.Entry(f, textvariable=vars_d["cooldown_time"], width=6).grid(row=2, column=1, sticky=tk.W, padx=(20, 0), pady=2)
+        ttk.Radiobutton(f, text="Temp (°C)", variable=vars_d["cooldown_mode"], value="temp").grid(row=3, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(f, text="Bed:").grid(row=4, column=0, sticky=tk.W, padx=(20, 4))
+        ttk.Entry(f, textvariable=vars_d["cooldown_temp"], width=6).grid(row=4, column=1, sticky=tk.W, pady=2)
+        ttk.Checkbutton(f, text="Skip nozzle load line", variable=vars_d["remove_purge"]).grid(row=5, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(f, text="Bed level every N loops:").grid(row=6, column=0, sticky=tk.W, padx=(0, 4))
+        ttk.Entry(f, textvariable=vars_d["bed_level_interval"], width=4).grid(row=6, column=1, sticky=tk.W, pady=2)
+
+        def on_ok():
+            bm = vars_d["bending_mode"].get()
+            item["settings"] = {
+                "cooldown_mode": vars_d["cooldown_mode"].get(),
+                "cooldown_time": vars_d["cooldown_time"].get(),
+                "cooldown_temp": vars_d["cooldown_temp"].get(),
+                "cooldown_hold_seconds": vars_d["cooldown_hold_seconds"].get(),
+                "loop_count": vars_d["loop_count"].get(),
+                "bed_level_interval": vars_d["bed_level_interval"].get(),
+                "remove_purge_line": vars_d["remove_purge"].get(),
+                "fans_during_cooldown": vars_d["fans_during_cooldown"].get(),
+                "skip_retraction_between_loops": vars_d["skip_retraction_between_loops"].get(),
+                "reheat_between_loops": vars_d["reheat_between_loops"].get(),
+                "preheat_bed_temp": vars_d["preheat_bed_temp"].get(),
+                "preheat_nozzle_temp": vars_d["preheat_nozzle_temp"].get(),
+                "push_height_mode": vars_d["push_height_mode"].get(),
+                "push_height_mm": vars_d["push_height_mm"].get(),
+                "push_height_offset_mm": vars_d["push_height_offset_mm"].get(),
+                "bending_mode": "nhdfarm" if bm == "on" else "none",
+                "push_mode": vars_d["push_mode"].get(),
+            }
+            dlg.destroy()
+
+        ttk.Button(f, text="OK", command=on_ok).grid(row=7, column=0, padx=(0, 4), pady=(12, 0))
+        ttk.Button(f, text="Cancel", command=dlg.destroy).grid(row=7, column=1, pady=(12, 0))
+
+    def add_file():
         path = filedialog.askopenfilename(
-            title="Load 3MF",
+            title="Add 3MF",
             filetypes=[("3MF files", "*.3mf"), ("All files", "*.*")],
         )
         if path:
-            input_path_var.set(path)
-            try:
-                autoclear = get_autoclear_settings(Path(path))
-                if autoclear:
-                    gui_data = autoclear_to_gui_settings(autoclear)
-                    if gui_data:
-                        apply_settings_to_gui(
-                            gui_data,
-                            cooldown_mode_var=cooldown_mode_var,
-                            cooldown_time_var=cooldown_time_var,
-                            cooldown_temp_var=cooldown_temp_var,
-                            cooldown_hold_seconds_var=cooldown_hold_seconds_var,
-                            push_height_mode_var=push_height_mode_var,
-                            push_height_mm_var=push_height_mm_var,
-                            push_height_offset_var=push_height_offset_var,
-                            bending_mode_var=bending_mode_var,
-                            push_mode_var=push_mode_var,
-                            loop_count_var=loop_count_var,
-                            bed_level_interval_var=bed_level_interval_var,
-                            remove_purge_var=remove_purge_var,
-                            skip_retraction_between_loops_var=skip_retraction_between_loops_var,
-                            fans_during_cooldown_var=fans_during_cooldown_var,
-                            reheat_between_loops_var=reheat_between_loops_var,
-                            preheat_bed_temp_var=preheat_bed_temp_var,
-                            preheat_nozzle_temp_var=preheat_nozzle_temp_var,
-                            template_text=template_text,
-                            default_template=DEFAULT_TEMPLATE.strip(),
-                        )
-            except Exception as e:
-                messagebox.showwarning("Load 3MF", f"Could not load autoclear settings from file:\n{e}")
-            # Set Auto push height to recommended (5 mm from bed) when file is loaded
+            autoclear = get_autoclear_settings(Path(path))
+            gui_data = autoclear_to_gui_settings(autoclear) if autoclear else {}
+            if not gui_data:
+                gui_data = _dict_from_gui_for_file()
+            file_list_data.append({"path": path, "settings": gui_data})
+            _refresh_file_list_ui()
+            if len(file_list_data) == 1:
+                apply_settings_to_gui(
+                    gui_data,
+                    cooldown_mode_var=cooldown_mode_var,
+                    cooldown_time_var=cooldown_time_var,
+                    cooldown_temp_var=cooldown_temp_var,
+                    cooldown_hold_seconds_var=cooldown_hold_seconds_var,
+                    push_height_mode_var=push_height_mode_var,
+                    push_height_mm_var=push_height_mm_var,
+                    push_height_offset_var=push_height_offset_var,
+                    bending_mode_var=bending_mode_var,
+                    push_mode_var=push_mode_var,
+                    loop_count_var=loop_count_var,
+                    bed_level_interval_var=bed_level_interval_var,
+                    remove_purge_var=remove_purge_var,
+                    skip_retraction_between_loops_var=skip_retraction_between_loops_var,
+                    fans_during_cooldown_var=fans_during_cooldown_var,
+                    reheat_between_loops_var=reheat_between_loops_var,
+                    preheat_bed_temp_var=preheat_bed_temp_var,
+                    preheat_nozzle_temp_var=preheat_nozzle_temp_var,
+                    template_text=template_text,
+                    default_template=DEFAULT_TEMPLATE.strip(),
+                )
             path_obj = Path(path)
             max_z = get_max_z_from_3mf(path_obj)
             if max_z is not None and max_z > 0:
@@ -221,7 +344,30 @@ def create_gui() -> tk.Tk:
                 auto_slider.config(to=max(1, int(max_z)))
             refresh_preview()
 
-    ttk.Button(file_frame, text="Load 3MF", command=load_file).pack(side=tk.LEFT, padx=(0, 4))
+    def remove_files():
+        sel = list(file_listbox.curselection())
+        for i in reversed(sel):
+            file_list_data.pop(i)
+        _refresh_file_list_ui()
+        if file_list_data:
+            refresh_preview()
+        else:
+            input_path_var.set("")
+
+    def settings_for_selected():
+        sel = file_listbox.curselection()
+        if len(sel) == 1:
+            _show_file_settings_dialog(sel[0])
+        elif len(sel) > 1:
+            messagebox.showinfo("Settings", "Edit one file at a time. Select a single file and click Settings.")
+        else:
+            messagebox.showinfo("Settings", "Select a file first.")
+
+    btn_row = ttk.Frame(file_frame)
+    btn_row.pack(fill=tk.X, pady=(6, 0))
+    ttk.Button(btn_row, text="Add 3MF", command=add_file).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(btn_row, text="Remove", command=remove_files).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(btn_row, text="Settings", command=settings_for_selected).pack(side=tk.LEFT)
 
     # --- Top row: Cooldown | Settings ---
     top_row = ttk.Frame(main_tab)
@@ -740,14 +886,15 @@ def create_gui() -> tk.Tk:
             pass
 
     def do_export():
-        inp = input_path_var.get().strip()
-        if not inp:
-            messagebox.showerror("Error", "Please load a 3MF file first.")
+        if not file_list_data:
+            messagebox.showerror("Error", "Please add at least one 3MF file first.")
             return
-        path = Path(inp)
-        if not path.exists():
-            messagebox.showerror("Error", f"File not found: {path}")
-            return
+        paths = [Path(item["path"]) for item in file_list_data]
+        for p in paths:
+            if not p.exists():
+                messagebox.showerror("Error", f"File not found: {p}")
+                return
+        path = paths[0]  # primary path for preview/default name
 
         push_height_mode = push_height_mode_var.get()
         max_z = get_max_z_from_3mf(path) or 10.0
@@ -793,7 +940,7 @@ def create_gui() -> tk.Tk:
         stem = path.stem
         if stem.endswith(".gcode"):
             stem = Path(stem).stem
-        default_name = f"{stem}_autoclear.3mf"
+        default_name = f"{stem}_autoclear.3mf" if len(file_list_data) == 1 else "merged_autoclear.3mf"
         exp_dir = default_export_path_var.get().strip()
         initial_dir = exp_dir if exp_dir and Path(exp_dir).is_dir() else str(path.parent)
         out_path = filedialog.asksaveasfilename(
@@ -827,27 +974,63 @@ def create_gui() -> tk.Tk:
                 preheat_nozzle = max(0, min(300, preheat_nozzle))
             except (ValueError, AttributeError):
                 preheat_nozzle = 150
-            result = process_3mf(
-                input_path=path,
-                output_path=out_path,
-                cooldown_mode=cooldown_mode,
-                cooldown_value=cooldown_value,
-                push_height_mode=push_height_mode,
-                push_height_mm=push_height_mm,
-                push_height_offset_mm=push_height_offset_mm,
-                bending_mode="nhdfarm" if bending_mode_var.get() == "on" else "none",
-                push_mode=push_mode_var.get(),
-                template=template,
-                loop_count=loop_count,
-                bed_level_interval=max(0, int(bed_level_interval_var.get().strip() or "0")),
-                remove_purge_line=remove_purge_var.get(),
-                fans_during_cooldown=fans_during_cooldown_var.get(),
-                skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
-                reheat_between_loops=reheat_between_loops_var.get(),
-                preheat_bed_temp=preheat_bed,
-                preheat_nozzle_temp=preheat_nozzle,
-                cooldown_hold_seconds=cooldown_hold,
-            )
+
+            input_for_process = path
+            if len(file_list_data) > 1:
+                with tempfile.NamedTemporaryFile(suffix=".3mf", delete=False) as tmp:
+                    merge_3mf_files(
+                        [item["path"] for item in file_list_data],
+                        tmp.name,
+                        settings_per_file=[item["settings"] for item in file_list_data],
+                    )
+                    input_for_process = Path(tmp.name)
+                try:
+                    result = process_3mf(
+                        input_path=input_for_process,
+                        output_path=out_path,
+                        cooldown_mode=cooldown_mode,
+                        cooldown_value=cooldown_value,
+                        push_height_mode=push_height_mode,
+                        push_height_mm=push_height_mm,
+                        push_height_offset_mm=push_height_offset_mm,
+                        bending_mode="nhdfarm" if bending_mode_var.get() == "on" else "none",
+                        push_mode=push_mode_var.get(),
+                        template=template,
+                        loop_count=loop_count,
+                        bed_level_interval=max(0, int(bed_level_interval_var.get().strip() or "0")),
+                        remove_purge_line=remove_purge_var.get(),
+                        fans_during_cooldown=fans_during_cooldown_var.get(),
+                        skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
+                        reheat_between_loops=reheat_between_loops_var.get(),
+                        preheat_bed_temp=preheat_bed,
+                        preheat_nozzle_temp=preheat_nozzle,
+                        cooldown_hold_seconds=cooldown_hold,
+                    )
+                finally:
+                    if input_for_process.exists():
+                        input_for_process.unlink(missing_ok=True)
+            else:
+                result = process_3mf(
+                    input_path=path,
+                    output_path=out_path,
+                    cooldown_mode=cooldown_mode,
+                    cooldown_value=cooldown_value,
+                    push_height_mode=push_height_mode,
+                    push_height_mm=push_height_mm,
+                    push_height_offset_mm=push_height_offset_mm,
+                    bending_mode="nhdfarm" if bending_mode_var.get() == "on" else "none",
+                    push_mode=push_mode_var.get(),
+                    template=template,
+                    loop_count=loop_count,
+                    bed_level_interval=max(0, int(bed_level_interval_var.get().strip() or "0")),
+                    remove_purge_line=remove_purge_var.get(),
+                    fans_during_cooldown=fans_during_cooldown_var.get(),
+                    skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
+                    reheat_between_loops=reheat_between_loops_var.get(),
+                    preheat_bed_temp=preheat_bed,
+                    preheat_nozzle_temp=preheat_nozzle,
+                    cooldown_hold_seconds=cooldown_hold,
+                )
             messagebox.showinfo("Success", f"Exported to:\n{result}")
             if open_export_folder_var.get():
                 _open_folder_in_explorer(Path(result).parent)

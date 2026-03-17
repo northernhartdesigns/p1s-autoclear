@@ -3,6 +3,7 @@ Main 3MF processing logic: load, modify machine_end_gcode, save.
 """
 
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -33,6 +34,7 @@ def get_autoclear_settings(input_path: str | Path) -> dict:
     """Read p1s_autoclear_settings from a 3MF (Metadata/p1s_autoclear_settings.json).
     Returns a dict with loop_count, cooldown_mode/value, push_height*, bending_mode,
     remove_purge_line, template. Returns {} if file not found or unparseable.
+    Supports plate_settings for per-plate overrides in merged multi-file 3MFs.
     """
     input_path = Path(input_path)
     if not input_path.exists():
@@ -46,6 +48,27 @@ def get_autoclear_settings(input_path: str | Path) -> dict:
         return json.loads(data.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         return {}
+
+
+def get_plate_settings(
+    settings: dict,
+    plate_num: int,
+    defaults: dict | None = None,
+) -> dict:
+    """Resolve per-plate settings from autoclear_settings.
+    Returns plate_settings[str(plate_num)] merged over defaults/top-level.
+    Plate overrides take precedence. Missing keys fall back to defaults or top-level.
+    """
+    base = dict(defaults) if defaults else {}
+    # Apply top-level keys as defaults (excluding plate_settings itself)
+    for k, v in settings.items():
+        if k != "plate_settings" and v is not None:
+            base.setdefault(k, v)
+    plate_overrides = settings.get("plate_settings") or {}
+    override = plate_overrides.get(str(plate_num))
+    if override:
+        base = {**base, **{k: v for k, v in override.items() if v is not None}}
+    return base
 
 
 def process_3mf(
@@ -140,6 +163,37 @@ def process_3mf(
         all_files = {info.filename.replace("\\", "/"): zf_in.read(info.filename) for info in zf_in.infolist()}
         config_paths = find_config_files(zf_in)
 
+    # Existing autoclear_settings from input (may have plate_settings for merged files)
+    existing_autoclear: dict = {}
+    if AUTOCLEAR_SETTINGS_PATH in all_files:
+        try:
+            existing_autoclear = json.loads(all_files[AUTOCLEAR_SETTINGS_PATH].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+    # Defaults from function params for get_plate_settings resolution
+    param_defaults = {
+        "cooldown_mode": cooldown_mode,
+        "cooldown_value": cooldown_value,
+        "cooldown_hold_seconds": cooldown_hold_seconds,
+        "loop_count": loop_count,
+        "remove_purge_line": remove_purge_line,
+        "fans_during_cooldown": fans_during_cooldown,
+        "skip_retraction_between_loops": skip_retraction_between_loops,
+        "reheat_between_loops": reheat_between_loops,
+        "preheat_bed_temp": preheat_bed_temp,
+        "preheat_nozzle_temp": preheat_nozzle_temp,
+        "push_height_mode": push_height_mode,
+        "push_height_mm": push_height_mm,
+        "push_height_offset_mm": push_height_offset_mm,
+        "bending_mode": bending_mode,
+        "push_mode": push_mode,
+        "template": template or "",
+    }
+    if push_heights is not None and len(push_heights) > 0:
+        param_defaults["push_heights"] = push_heights
+        param_defaults["use_plate_flex"] = use_plate_flex if use_plate_flex is not None else False
+
     found_end_gcode = False
     for config_path in config_paths:
         cfg_data = all_files.get(config_path)
@@ -171,46 +225,75 @@ def process_3mf(
             all_files[config_path] = serialize_config(config, cfg_data)
 
     # Process sliced G-code in Metadata/plate_*.gcode (inject auto-clear, purge, loops)
+    plate_match = re.compile(r"Metadata/plate_(\d+)\.gcode$").match
+
     for name in list(all_files.keys()):
         if "Metadata/plate_" in name and name.endswith(".gcode"):
+            m = plate_match(name.replace("\\", "/"))
+            plate_num = int(m.group(1)) if m else 1
+            resolved = get_plate_settings(
+                {**param_defaults, **existing_autoclear},
+                plate_num,
+                defaults=param_defaults,
+            )
+            # Resolved values (with type coercion for injector)
+            r_loop = max(1, min(999, int(resolved.get("loop_count", 1))))
+            r_cooldown_mode = str(resolved.get("cooldown_mode", "temp"))
+            r_cooldown_value = float(resolved.get("cooldown_value", 35))
+            r_cooldown_hold = float(resolved.get("cooldown_hold_seconds", 60))
+            r_remove_purge = bool(resolved.get("remove_purge_line", False))
+            r_fans = bool(resolved.get("fans_during_cooldown", False))
+            r_skip_retract = bool(resolved.get("skip_retraction_between_loops", True))
+            r_reheat = bool(resolved.get("reheat_between_loops", False))
+            r_preheat_bed = max(0, min(150, int(resolved.get("preheat_bed_temp", 70))))
+            r_preheat_nozzle = max(0, min(300, int(resolved.get("preheat_nozzle_temp", 150))))
+            r_push_mode = str(resolved.get("push_mode", "center_and_sweep"))
+            r_push_height_mode = str(resolved.get("push_height_mode", "auto"))
+            r_push_height_mm = float(resolved.get("push_height_mm", 5.0))
+            r_push_height_offset = int(resolved.get("push_height_offset_mm", 20))
+            r_bending = str(resolved.get("bending_mode", "nhdfarm"))
+            r_template = resolved.get("template") or None
+            r_push_heights = resolved.get("push_heights")
+            r_use_plate_flex = resolved.get("use_plate_flex")
+
             raw = all_files[name]
             try:
                 gcode = raw.decode("utf-8")
             except UnicodeDecodeError:
                 continue
             # Inject auto-clear into plate gcode (same as Auto-Clear) - before purge/loops
-            if push_heights is None or len(push_heights) == 0:
+            if r_push_heights is None or len(r_push_heights) == 0:
                 max_z = parse_max_z_from_plate_gcode(gcode)
                 if max_z is not None:
                     plate_block = build_injection_block_expanded(
                         max_layer_z=max_z,
-                        cooldown_mode=cooldown_mode,
-                        cooldown_value=cooldown_value,
-                        push_height_mode=push_height_mode,
-                        push_height_mm=push_height_mm,
-                        push_height_offset_mm=push_height_offset_mm,
-                        bending_mode=bending_mode,
-                        push_mode=push_mode,
-                        template=template,
-                        fans_during_cooldown=fans_during_cooldown,
-                        reheat_between_loops=reheat_between_loops,
-                        preheat_bed_temp=preheat_bed_temp,
-                        preheat_nozzle_temp=preheat_nozzle_temp,
-                        loop_count=loop_count,
+                        cooldown_mode=r_cooldown_mode,
+                        cooldown_value=r_cooldown_value,
+                        push_height_mode=r_push_height_mode,
+                        push_height_mm=r_push_height_mm,
+                        push_height_offset_mm=r_push_height_offset,
+                        bending_mode=r_bending,
+                        push_mode=r_push_mode,
+                        template=r_template,
+                        fans_during_cooldown=r_fans,
+                        reheat_between_loops=r_reheat,
+                        preheat_bed_temp=r_preheat_bed,
+                        preheat_nozzle_temp=r_preheat_nozzle,
+                        loop_count=r_loop,
                         part_bounds=part_bounds,
-                        cooldown_hold_seconds=cooldown_hold_seconds,
+                        cooldown_hold_seconds=r_cooldown_hold,
                     )
                     gcode = inject_autoclear_into_plate_gcode(gcode, plate_block)
-            if remove_purge_line:
+            if r_remove_purge:
                 gcode = remove_purge_line_from_gcode(gcode)
-            if loop_count > 1:
+            if r_loop > 1:
                 gcode = wrap_plate_gcode_in_loops(
                     gcode,
-                    loop_count,
-                    skip_retraction_between_loops=skip_retraction_between_loops,
-                    reheat_between_loops=reheat_between_loops,
-                    preheat_bed_temp=preheat_bed_temp,
-                    preheat_nozzle_temp=preheat_nozzle_temp,
+                    r_loop,
+                    skip_retraction_between_loops=r_skip_retract,
+                    reheat_between_loops=r_reheat,
+                    preheat_bed_temp=r_preheat_bed,
+                    preheat_nozzle_temp=r_preheat_nozzle,
                 )
             all_files[name] = gcode.encode("utf-8")
 
@@ -245,6 +328,8 @@ def process_3mf(
         autoclear_settings["push_mode"] = push_mode
     if template:
         autoclear_settings["template"] = template
+    if existing_autoclear.get("plate_settings"):
+        autoclear_settings["plate_settings"] = existing_autoclear["plate_settings"]
     all_files[AUTOCLEAR_SETTINGS_PATH] = json.dumps(
         autoclear_settings, indent=2
     ).encode("utf-8")

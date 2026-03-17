@@ -13,8 +13,9 @@ NHDFARM-style G-code injection for Bambu Lab P1S (and P1P/X1C) automation. Injec
 - **Z-height caution**: Bambu default printable height is 250 mm (not 256 mm; 6 mm reserved for z-hop/debris). NHDFARM bending uses Z235, which is close to that limit—debris or dust caps can cause roof collision. Use bending "none" or "z_pop" if you see grinding or collision. See [Bambu Lab: Print volume limitations](https://wiki.bambulab.com/en/knowledge-sharing/print-volume-limitations)
 - **Editable G-code template**: Customize the injection block (placeholders: `{cooldown}`, `{bending}`, `{sweeps}`)
 - **Loop count**: Set how many times to run the project (1–999), stored in 3MF metadata
+- **Multi-file merge**: Add multiple 3MF files, configure per-file settings (cooldown, loops), export one merged 3MF
 - **Remove purge line**: Option to remove the filament purge line (orange line at front of bed) from start G-code
-- **Run Loop script**: Automatically send the job to your P1S, wait for completion, and repeat
+- **Run Loop script**: Automatically send the job to your P1S, wait for completion, and repeat (supports multi-plate)
 
 ## Requirements
 
@@ -50,13 +51,11 @@ python -m p1s_autoclear
 ## Usage
 
 1. Run the GUI: `python -m p1s_autoclear`
-2. Click **Load 3MF** and select your Bambu Studio project file
-3. Configure:
-   - **Cooldown**: Time (seconds) or Temperature (°C)
-   - **Push heights**: Comma-separated fractions (0.9, 0.6, 0.4, 0.2) or fixed mm
-   - **G-code template**: Edit if you need custom behavior
-4. Click **Export 3MF** and save the modified file
-5. Open the exported 3MF in Bambu Studio, slice, and print as usual
+2. Click **Add 3MF** to add one or more sliced 3MF files (each must have `Metadata/plate_1.gcode`)
+3. For multiple files, use **Settings** on each to set per-file cooldown, loop count, etc.
+4. Configure cooldown, push height, loop count, etc. (main form applies to the first/single file)
+5. Click **Export 3MF** and save. Single-file: one 3MF with auto-clear. Multi-file: merged 3MF with per-plate settings.
+6. Open in Bambu Studio or use Run Loop to print
 
 The injected G-code runs at the end of each print: after the hotend and timelapse finish, the bed cools (time or temp), then the toolhead sweeps at multiple Z heights to push the part off into your collection bin.
 

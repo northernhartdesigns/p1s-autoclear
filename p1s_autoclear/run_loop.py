@@ -6,7 +6,9 @@ Requires: pip install bambulabs_api
 Usage:
   python -m p1s_autoclear.run_loop path/to/autoclear.gcode.3mf
   python -m p1s_autoclear.run_loop path/to/autoclear.gcode --loop 5
-  python -m p1s_autoclear.run_loop path/to/autoclear.gcode.3mf --bed-level-interval 5
+  python -m p1s_autoclear.run_loop path/to/merged_autoclear.3mf --bed-level-interval 5
+
+Multi-plate 3MFs (from GUI merge) are printed plate by plate, with per-plate loop counts from plate_settings.
 
 Environment:
   BAMBU_IP          - Printer IP (e.g. 192.168.1.200)
@@ -24,7 +26,29 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-from .processor import AUTOCLEAR_SETTINGS_PATH, get_autoclear_settings
+from .processor import AUTOCLEAR_SETTINGS_PATH, get_autoclear_settings, get_plate_settings
+
+
+def get_plate_count(path: Path) -> int:
+    """Count Metadata/plate_*.gcode entries in the 3MF. Returns 1 for non-3MF or if none found."""
+    path = Path(path)
+    if path.suffix.lower() not in (".3mf", ".gcode.3mf"):
+        return 1
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = [n.replace("\\", "/") for n in zf.namelist()]
+        count = sum(1 for n in names if n.startswith("Metadata/plate_") and n.endswith(".gcode"))
+        return max(1, count)
+    except (zipfile.BadZipFile, OSError):
+        return 1
+
+
+def get_loop_count_for_plate(settings: dict, plate_num: int, override: int | None) -> int:
+    """Get loop count for a specific plate from plate_settings or top-level, or override."""
+    if override is not None:
+        return max(1, min(999, override))
+    resolved = get_plate_settings(settings, plate_num, defaults=settings)
+    return max(1, min(999, int(resolved.get("loop_count", 1))))
 
 
 def get_loop_count(path: Path, override: int | None) -> int:
@@ -157,6 +181,7 @@ def run_loop(
         sys.exit(1)
 
     path = Path(file_path)
+    loop_override = loop_count  # preserve for per-plate override
     loop_count = get_loop_count(path, loop_count)
     bed_level_interval_val = get_bed_level_interval(path, bed_level_interval)
     delay = delay if delay is not None else int(os.environ.get("BAMBU_LOOP_DELAY", "60"))
@@ -172,9 +197,14 @@ def run_loop(
         )
         sys.exit(1)
 
+    plate_count = get_plate_count(path)
+    settings = get_autoclear_settings(path) if path.suffix.lower() in (".3mf", ".gcode.3mf") else {}
+
     print(f"Connecting to {ip} (serial: {serial})")
     print(f"File: {path}")
-    print(f"Loops: {loop_count}")
+    print(f"Plates: {plate_count}")
+    if plate_count == 1:
+        print(f"Loops: {loop_count}")
     print(f"Bed level: first loop only" if bed_level_interval_val == 0 else f"Bed level: loop 1 + every {bed_level_interval_val} loops")
     print("-" * 40)
 
@@ -182,13 +212,22 @@ def run_loop(
     printer.connect()
     time.sleep(2)
 
-    zip_buf, upload_name, gcode_location = load_print_file(path)
+    zip_buf, upload_name, _ = load_print_file(path)
 
-    for run in range(1, loop_count + 1):
-        print(f"\n--- Loop {run}/{loop_count} ---")
+    # Build list of (plate_num, run_in_plate) for sequencing; global_run for bed level
+    tasks: list[tuple[int, int, int]] = []  # (plate_num, run_in_plate, global_run_index)
+    global_run = 0
+    for plate_num in range(1, plate_count + 1):
+        plate_loops = get_loop_count_for_plate(settings, plate_num, loop_override)
+        for run_in_plate in range(1, plate_loops + 1):
+            global_run += 1
+            tasks.append((plate_num, run_in_plate, global_run))
 
-        # Reload file each time (reuse same buffer for same file)
-        zip_buf, upload_name, gcode_location = load_print_file(path)
+    total_runs = len(tasks)
+    for idx, (plate_num, run_in_plate, global_run) in enumerate(tasks, start=1):
+        print(f"\n--- Run {idx}/{total_runs} (Plate {plate_num}, loop {run_in_plate}) ---")
+
+        zip_buf, upload_name, _ = load_print_file(path)
         zip_buf.seek(0)
 
         result = printer.upload_file(zip_buf, upload_name)
@@ -196,11 +235,11 @@ def run_loop(
             print(f"Error uploading file: {result}", file=sys.stderr)
             printer.disconnect()
             sys.exit(1)
-        do_bed_level = should_run_bed_leveling(run, loop_count, bed_level_interval_val)
-        do_flow_calib = do_bed_level  # flow calib when we level
+        do_bed_level = should_run_bed_leveling(global_run, total_runs, bed_level_interval_val)
+        do_flow_calib = do_bed_level
         print("Uploaded. Starting print..." + (" (with bed leveling)" if do_bed_level else " (skip bed leveling)"))
         ok = _start_print_with_bed_level_control(
-            printer, upload_name, 1,
+            printer, upload_name, plate_num,
             bed_leveling=do_bed_level,
             flow_calibration=do_flow_calib,
         )
@@ -221,15 +260,15 @@ def run_loop(
                     print("Print failed!", file=sys.stderr)
                     printer.disconnect()
                     sys.exit(1)
-                print(f"Loop {run}/{loop_count} complete.")
+                print(f"Run {idx}/{total_runs} complete.")
                 break
 
-        if run < loop_count:
-            print(f"Cooling and auto-clear will run. Next loop in {delay}s...")
+        if idx < total_runs:
+            print(f"Cooling and auto-clear will run. Next run in {delay}s...")
             time.sleep(delay)
 
     printer.disconnect()
-    print("\nAll loops finished.")
+    print("\nAll runs finished.")
 
 
 def main() -> None:
