@@ -5,19 +5,21 @@ GUI for P1S Auto-Clear: load 3MF, configure cooldown/push heights, export.
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 from . import __version__
-from .injector import DEFAULT_TEMPLATE
+from .git_sync import current_branch, find_repo_root, update_from_github
+from .injector import DEFAULT_TEMPLATE, PUSHER_MIN_HEIGHT_MM
 from .preview import (
     compute_sweep_z,
     draw_preview_on_canvas,
     get_max_z_from_3mf,
 )
-from .merge_3mf import merge_3mf_files
+from .merge_3mf import merge_3mf_chain_files, merge_3mf_files
 from .processor import get_autoclear_settings, process_3mf
 from .settings import (
     BUILTIN_PROFILES,
@@ -35,14 +37,58 @@ from .settings import (
 )
 
 
+_active_tooltips: set = set()
+_tooltip_focus_bound = False
+
+
+def _hide_all_tooltips(*args) -> None:
+    """Destroy all active tooltips (e.g. when window loses focus)."""
+    for tw in list(_active_tooltips):
+        try:
+            tw.destroy()
+        except tk.TclError:
+            pass
+        _active_tooltips.discard(tw)
+
+
+def _bind_tooltip_to_widget_and_children(widget, on_enter, on_leave) -> None:
+    """Bind Enter/Leave to widget and all descendants so tooltips work on container widgets."""
+    widget.bind("<Enter>", on_enter)
+    widget.bind("<Leave>", on_leave)
+    for child in widget.winfo_children():
+        _bind_tooltip_to_widget_and_children(child, on_enter, on_leave)
+
+
 def _create_tooltip(widget, text: str) -> None:
     """Create a hover tooltip for a widget.
     Binds Enter/Leave to show/hide a small popup with the given text.
+    Also binds to children so tooltips work when hovering anywhere in a container (e.g. Frame).
+    Tooltips are cleared when the window loses focus (prevents stuck tooltips).
     """
     tip = [None]
+    hide_job = [None]  # after_id for delayed hide
+
+    def hide_tooltip():
+        if tip[0]:
+            try:
+                tip[0].destroy()
+            except tk.TclError:
+                pass
+            _active_tooltips.discard(tip[0])
+            tip[0] = None
+
+    def cancel_pending_hide():
+        if hide_job[0] is not None:
+            try:
+                widget.after_cancel(hide_job[0])
+            except tk.TclError:
+                pass
+            hide_job[0] = None
 
     def on_enter(event):
-        tip[0] = tw = tk.Toplevel(widget)
+        cancel_pending_hide()
+        hide_tooltip()  # Clear any existing (prevents duplicates when Enter fires repeatedly)
+        tw = tk.Toplevel(widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
         tk.Label(
@@ -50,14 +96,40 @@ def _create_tooltip(widget, text: str) -> None:
             background="#3C3C42", foreground="#E0E0E0",
             relief=tk.SOLID, borderwidth=1, font=("", 9),
         ).pack(padx=4, pady=2)
+        tip[0] = tw
+        _active_tooltips.add(tw)
 
     def on_leave(event):
-        if tip[0]:
-            tip[0].destroy()
-            tip[0] = None
+        # Brief delay: avoid hiding when moving between widget and its children
+        root = widget.winfo_toplevel()
 
-    widget.bind("<Enter>", on_enter)
-    widget.bind("<Leave>", on_leave)
+        def do_hide():
+            hide_job[0] = None
+            # Only hide if mouse is actually outside the widget and its descendants
+            try:
+                x = root.winfo_pointerx()
+                y = root.winfo_pointery()
+                wx = widget.winfo_rootx()
+                wy = widget.winfo_rooty()
+                ww = widget.winfo_width()
+                wh = widget.winfo_height()
+                if x < wx or x >= wx + ww or y < wy or y >= wy + wh:
+                    hide_tooltip()
+            except tk.TclError:
+                hide_tooltip()
+
+        cancel_pending_hide()
+        hide_job[0] = widget.after(100, do_hide)
+
+    _bind_tooltip_to_widget_and_children(widget, on_enter, on_leave)
+
+    # Clear tooltips when window loses focus or mouse leaves the window
+    global _tooltip_focus_bound
+    if not _tooltip_focus_bound:
+        root = widget.winfo_toplevel()
+        root.bind("<FocusOut>", _hide_all_tooltips)
+        root.bind("<Leave>", lambda e: root.after(50, _hide_all_tooltips))
+        _tooltip_focus_bound = True
 
 
 # Bambu Lab dark theme colors (branded)
@@ -93,7 +165,7 @@ def create_gui() -> tk.Tk:
     Loads last-used settings on startup; saves them on close.
     """
     root = tk.Tk()
-    root.title(f"P1S Auto-Clear v{__version__} - NHDFARM-Style G-code Injector")
+    root.title(f"P1S Auto-Clear v{__version__}")
     root.minsize(580, 680)
     root.geometry("640x750")
     root.resizable(True, False)  # Allow horizontal resize only; prevent vertical shrinking
@@ -137,11 +209,8 @@ def create_gui() -> tk.Tk:
     push_height_mode_var = tk.StringVar(value="auto")
     push_height_mm_var = tk.StringVar(value="5")
     push_height_offset_var = tk.StringVar(value="20")
-    auto_sweep_z_var = tk.DoubleVar(value=30)  # Slider: sweep Z (mm from bed); default ~50-20
-    last_max_z: list[float | None] = [None]  # Mutable holder for max part height (for slider range)
     bending_mode_var = tk.StringVar(value="on")
     push_mode_var = tk.StringVar(value="center_and_sweep")
-    recommended_label_var = tk.StringVar(value="mm (recommended ≥5)")
     # App config (Settings tab)
     default_export_path_var = tk.StringVar(value="")
     open_export_folder_var = tk.BooleanVar(value=False)
@@ -190,13 +259,67 @@ def create_gui() -> tk.Tk:
     list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     file_listbox.configure(yscrollcommand=list_scroll.set)
 
-    def _refresh_file_list_ui():
+    _last_selected_idx: list[int | None] = [None]  # mutable so closures can update
+
+    def _update_selected_heading():
+        sel = file_listbox.curselection()
+        if len(sel) == 1 and file_list_data:
+            name = Path(file_list_data[sel[0]]["path"]).name
+            file_frame.configure(text=f"3MF Files — Selected: {name}")
+        else:
+            file_frame.configure(text="3MF Files")
+
+    def _on_file_selection_changed():
+        sel = file_listbox.curselection()
+        prev = _last_selected_idx[0]
+        if prev is not None and prev < len(file_list_data):
+            file_list_data[prev]["settings"] = _dict_from_gui_for_file()
+        _last_selected_idx[0] = sel[0] if len(sel) == 1 else None
+        _update_selected_heading()
+        if len(sel) == 1 and file_list_data:
+            idx = sel[0]
+            apply_settings_to_gui(
+                file_list_data[idx]["settings"],
+                cooldown_mode_var=cooldown_mode_var,
+                cooldown_time_var=cooldown_time_var,
+                cooldown_temp_var=cooldown_temp_var,
+                cooldown_hold_seconds_var=cooldown_hold_seconds_var,
+                push_height_mode_var=push_height_mode_var,
+                push_height_mm_var=push_height_mm_var,
+                push_height_offset_var=push_height_offset_var,
+                bending_mode_var=bending_mode_var,
+                push_mode_var=push_mode_var,
+                loop_count_var=loop_count_var,
+                bed_level_interval_var=bed_level_interval_var,
+                remove_purge_var=remove_purge_var,
+                skip_retraction_between_loops_var=skip_retraction_between_loops_var,
+                fans_during_cooldown_var=fans_during_cooldown_var,
+                reheat_between_loops_var=reheat_between_loops_var,
+                preheat_bed_temp_var=preheat_bed_temp_var,
+                preheat_nozzle_temp_var=preheat_nozzle_temp_var,
+                template_text=template_text,
+                default_template=DEFAULT_TEMPLATE.strip(),
+            )
+            input_path_var.set(file_list_data[idx]["path"])
+            root.after(50, refresh_preview)
+
+    file_listbox.bind("<<ListboxSelect>>", lambda e: _on_file_selection_changed())
+
+    def _refresh_file_list_ui(select_index: int = 0):
         file_listbox.delete(0, tk.END)
         for item in file_list_data:
             p = Path(item["path"])
             file_listbox.insert(tk.END, p.name)
         if file_list_data:
-            input_path_var.set(file_list_data[0]["path"])
+            idx = min(select_index, len(file_list_data) - 1)
+            file_listbox.selection_set(idx)
+            file_listbox.see(idx)
+            _on_file_selection_changed()
+        else:
+            file_listbox.selection_clear(0, tk.END)
+            input_path_var.set("")
+            _last_selected_idx[0] = None
+            _update_selected_heading()
 
     def _dict_from_gui_for_file() -> dict:
         """Build settings dict from current main form vars (for single-file or defaults)."""
@@ -299,49 +422,29 @@ def create_gui() -> tk.Tk:
         ttk.Button(f, text="Cancel", command=dlg.destroy).grid(row=7, column=1, pady=(12, 0))
 
     def add_file():
-        path = filedialog.askopenfilename(
-            title="Add 3MF",
-            filetypes=[("3MF files", "*.3mf"), ("All files", "*.*")],
-        )
+        imp_dir = default_import_path_var.get().strip()
+        initial_dir = imp_dir if imp_dir and Path(imp_dir).is_dir() else None
+        if initial_dir is None and file_list_data:
+            first = Path(file_list_data[0]["path"])
+            if first.parent.exists():
+                initial_dir = str(first.parent)
+        kwargs: dict = {"title": "Add 3MF", "filetypes": [("3MF files", "*.3mf"), ("All files", "*.*")]}
+        if initial_dir:
+            kwargs["initialdir"] = initial_dir
+        path = filedialog.askopenfilename(**kwargs)
         if path:
             autoclear = get_autoclear_settings(Path(path))
             gui_data = autoclear_to_gui_settings(autoclear) if autoclear else {}
             if not gui_data:
                 gui_data = _dict_from_gui_for_file()
             file_list_data.append({"path": path, "settings": gui_data})
-            _refresh_file_list_ui()
-            if len(file_list_data) == 1:
-                apply_settings_to_gui(
-                    gui_data,
-                    cooldown_mode_var=cooldown_mode_var,
-                    cooldown_time_var=cooldown_time_var,
-                    cooldown_temp_var=cooldown_temp_var,
-                    cooldown_hold_seconds_var=cooldown_hold_seconds_var,
-                    push_height_mode_var=push_height_mode_var,
-                    push_height_mm_var=push_height_mm_var,
-                    push_height_offset_var=push_height_offset_var,
-                    bending_mode_var=bending_mode_var,
-                    push_mode_var=push_mode_var,
-                    loop_count_var=loop_count_var,
-                    bed_level_interval_var=bed_level_interval_var,
-                    remove_purge_var=remove_purge_var,
-                    skip_retraction_between_loops_var=skip_retraction_between_loops_var,
-                    fans_during_cooldown_var=fans_during_cooldown_var,
-                    reheat_between_loops_var=reheat_between_loops_var,
-                    preheat_bed_temp_var=preheat_bed_temp_var,
-                    preheat_nozzle_temp_var=preheat_nozzle_temp_var,
-                    template_text=template_text,
-                    default_template=DEFAULT_TEMPLATE.strip(),
-                )
+            _refresh_file_list_ui(select_index=len(file_list_data) - 1)
             path_obj = Path(path)
             max_z = get_max_z_from_3mf(path_obj)
             if max_z is not None and max_z > 0:
                 recommended_sweep_z = 5.0 if max_z >= 5 else max(1.0, max_z)
-                last_max_z[0] = max_z
                 push_height_mode_var.set("auto")
-                auto_sweep_z_var.set(recommended_sweep_z)
                 push_height_offset_var.set(str(max(1, int(max_z - recommended_sweep_z))))
-                auto_slider.config(to=max(1, int(max_z)))
             refresh_preview()
 
     def remove_files():
@@ -368,6 +471,19 @@ def create_gui() -> tk.Tk:
     ttk.Button(btn_row, text="Add 3MF", command=add_file).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(btn_row, text="Remove", command=remove_files).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(btn_row, text="Settings", command=settings_for_selected).pack(side=tk.LEFT)
+
+    chain_single_job_var = tk.BooleanVar(value=True)
+    chain_cb = ttk.Checkbutton(
+        file_frame,
+        text="One continuous print (all files in one job — auto-clear between each)",
+        variable=chain_single_job_var,
+    )
+    chain_cb.pack(anchor=tk.W, pady=(6, 0))
+    _create_tooltip(
+        chain_cb,
+        "When adding multiple 3MFs: ON = single print job (job1 → push → job2 → …). "
+        "OFF = separate Bambu plates (print each job manually).",
+    )
 
     # --- Top row: Cooldown | Settings ---
     top_row = ttk.Frame(main_tab)
@@ -463,12 +579,16 @@ def create_gui() -> tk.Tk:
     push_mode_combo = ttk.Combobox(
         push_mode_row,
         textvariable=push_mode_var,
-        values=("center_only", "center_and_sweep", "bump"),
+        values=("center_only", "center_and_sweep", "part_center", "part_center_sweep"),
         width=18,
         state="readonly",
     )
     push_mode_combo.pack(side=tk.LEFT)
-    _create_tooltip(push_mode_combo, "Center only: two pushes at center X. Center + sweep: center pushes plus rake passes. Bump: single targeted push at part center/back (requires trimesh).")
+    _create_tooltip(
+        push_mode_combo,
+        "Center only / + sweep: fixed bed columns. Part center: two safe-X pushes across print "
+        "footprint (from gcode). Part center + sweep: multiple columns, same safe X band (32–206 mm).",
+    )
 
     # --- Push height section (NHDFARM-style) ---
     heights_frame = ttk.LabelFrame(main_tab, text="Push Height", padding=6)
@@ -483,9 +603,6 @@ def create_gui() -> tk.Tk:
     controls_col = ttk.Frame(push_columns)
     controls_col.pack(side=tk.LEFT, fill=tk.Y)
 
-    recommended_label_var = tk.StringVar(value="mm (recommended ≥5)")
-
-    # Auto slider
     auto_row = ttk.Frame(controls_col)
     auto_row.pack(anchor=tk.W, pady=(6, 0))
     ttk.Radiobutton(
@@ -494,22 +611,14 @@ def create_gui() -> tk.Tk:
         variable=push_height_mode_var,
         value="auto",
     ).pack(side=tk.LEFT, padx=(0, 6))
-    auto_slider = tk.Scale(
-        auto_row,
-        from_=1,
-        to=50,
-        orient=tk.HORIZONTAL,
-        variable=auto_sweep_z_var,
-        resolution=1,
-        length=140,
-        showvalue=True,
-        bg=_BAMBU_BG,
-        fg=_BAMBU_FG,
-        troughcolor=_BAMBU_BG2,
-        activebackground=_BAMBU_ACCENT,
-        highlightthickness=0,
+    ttk.Label(auto_row, text="Offset:").pack(side=tk.LEFT, padx=(0, 4))
+    auto_offset_entry = ttk.Entry(auto_row, textvariable=push_height_offset_var, width=5)
+    auto_offset_entry.pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Label(auto_row, text="mm from part top").pack(side=tk.LEFT)
+    _create_tooltip(
+        auto_offset_entry,
+        "Sweep height ≈ max part height minus this offset. Larger offset = lower sweep (closer to bed). Try 20–30 if the pusher misses the part.",
     )
-    auto_slider.pack(side=tk.LEFT, padx=(0, 12))
 
     # Manual entry (below Auto, with space)
     manual_row = ttk.Frame(controls_col)
@@ -526,27 +635,28 @@ def create_gui() -> tk.Tk:
 
     push_ht_tip = ttk.Label(
         controls_col,
-        text="Larger offset\n= push closer to bed\nUse Manual for fixed Z height.",
+        text="Larger offset = sweep closer to bed.\nManual = fixed Z height in mm.",
         font=("", 8),
         justify=tk.LEFT,
     )
     push_ht_tip.pack(anchor=tk.W, pady=(2, 0))
-    _create_tooltip(push_ht_tip, "Auto: sweep at (max part height - offset) mm. Larger offset = lower Z = closer to bed. If push misses the part, try 25–30 mm.")
 
-    # Right column: side view preview
+    # Right column: side view preview (canvas left, text right)
     preview_col = ttk.LabelFrame(push_columns, text="Side view", padding=(6, 4))
     preview_col.pack(side=tk.LEFT, padx=(12, 0), fill=tk.BOTH, expand=True)
+    preview_row = ttk.Frame(preview_col)
+    preview_row.pack(pady=(4, 6))
     preview_canvas = tk.Canvas(
-        preview_col,
+        preview_row,
         width=180,
         height=120,
         bg=_BAMBU_CANVAS_BG,
         highlightthickness=1,
         highlightbackground=_BAMBU_BORDER,
     )
-    preview_canvas.pack(anchor=tk.W, pady=(4, 6))
+    preview_canvas.pack(side=tk.LEFT, padx=(0, 8))
     preview_text = tk.Text(
-        preview_col,
+        preview_row,
         height=4,
         width=24,
         wrap=tk.WORD,
@@ -557,57 +667,16 @@ def create_gui() -> tk.Tk:
         fg=_BAMBU_FG,
         cursor="arrow",
     )
-    preview_text.pack(anchor=tk.W, fill=tk.BOTH, expand=False)
+    preview_text.pack(side=tk.LEFT)
     # Placeholder so widget reserves full height (4 lines) before refresh_preview runs
     preview_text.config(state=tk.NORMAL)
-    preview_text.insert("1.0", "Load a 3MF to see\nsweep preview.\n\n\n")
+    preview_text.insert("1.0", "Load a 3MF\nto see preview.\n\n\n")
     preview_text.config(state=tk.DISABLED)
-
-    def sync_auto_slider_from_offset():
-        """Update slider range and value from max_z and stored offset."""
-        path = input_path_var.get().strip() or None
-        max_z_val = get_max_z_from_3mf(Path(path)) if path else None
-        max_z_val = max_z_val if max_z_val is not None and max_z_val > 0 else 50.0
-        last_max_z[0] = max_z_val
-        auto_slider.config(to=max(1, int(max_z_val)))
-        if push_height_mode_var.get() == "auto":
-            try:
-                offset = int(push_height_offset_var.get().strip() or 20)
-                sweep_z = max(1.0, min(max_z_val, max_z_val - offset))
-                auto_sweep_z_var.set(sweep_z)
-            except (ValueError, AttributeError):
-                auto_sweep_z_var.set(max(1, min(30, max_z_val - 20)))
-
-    def on_auto_slider_change(val):
-        max_z_val = last_max_z[0] or 50.0
-        try:
-            sweep_z = max(1.0, min(max_z_val, float(val)))
-            offset = max(1, int(max_z_val - sweep_z))
-            push_height_offset_var.set(str(offset))
-        except (ValueError, TypeError):
-            pass
-
-    auto_slider.config(command=on_auto_slider_change)
 
     def refresh_preview(*_args):
         path = input_path_var.get().strip() or None
         path_obj = Path(path) if path else None
-        max_z_val = get_max_z_from_3mf(path_obj) if path_obj else None
-        last_max_z[0] = max_z_val
-        # Sync slider range and value when path or settings change
-        if push_height_mode_var.get() == "auto":
-            max_for_range = max_z_val if max_z_val and max_z_val > 0 else 50.0
-            auto_slider.config(to=max(1, int(max_for_range)))
-            try:
-                offset = int(push_height_offset_var.get().strip() or 20)
-                sweep_z = max(1.0, min(max_for_range, max_for_range - offset))
-                if abs(auto_sweep_z_var.get() - sweep_z) > 0.5:
-                    auto_sweep_z_var.set(sweep_z)
-            except (ValueError, AttributeError):
-                pass
         offset_for_preview = push_height_offset_var.get()
-        if push_height_mode_var.get() == "auto" and max_z_val is not None and max_z_val > 0:
-            offset_for_preview = str(int(max(1, min(max_z_val - 1, max_z_val - auto_sweep_z_var.get()))))
         info = draw_preview_on_canvas(
             preview_canvas,
             path=path_obj,
@@ -619,14 +688,16 @@ def create_gui() -> tk.Tk:
         )
         preview_text.config(state=tk.NORMAL)
         preview_text.delete("1.0", tk.END)
-        preview_text.insert("1.0", info or "Load a 3MF to see sweep preview")
+        preview_text.insert("1.0", info or "Load a 3MF to see preview")
         preview_text.config(state=tk.DISABLED)
 
     def _schedule_refresh(*_a):
         root.after(50, refresh_preview)
 
-    for var in (push_height_mode_var, push_height_mm_var, push_height_offset_var, auto_sweep_z_var, push_mode_var):
+    for var in (push_height_mode_var, push_height_mm_var, push_height_offset_var, push_mode_var):
         var.trace_add("write", _schedule_refresh)
+    auto_offset_entry.bind("<KeyRelease>", lambda e: root.after(50, refresh_preview))
+    auto_offset_entry.bind("<FocusOut>", lambda e: refresh_preview())
     def clamp_manual_height(*_):
         try:
             v = float(push_height_mm_var.get().strip())
@@ -651,7 +722,7 @@ def create_gui() -> tk.Tk:
         combo["values"] = ["(Last used)", *builtins_to_show, *custom]
 
     profile_var = tk.StringVar(value="(Last used)")
-    combo = ttk.Combobox(profile_frame, textvariable=profile_var, width=25, state="readonly")
+    combo = ttk.Combobox(profile_frame, textvariable=profile_var, width=25)
     refresh_profile_combo()
     combo.pack(side=tk.LEFT, padx=(0, 5))
 
@@ -713,26 +784,16 @@ def create_gui() -> tk.Tk:
             template=template_text.get("1.0", tk.END).strip(),
         )
 
-    def save_profile_to_selected():
-        """Save current settings to the selected profile (updates built-in or custom)."""
-        sel = profile_var.get().strip()
-        if not sel or sel == "(Last used)":
-            messagebox.showinfo("Profile", "Select a named profile to update, or use 'Save as Profile' to create a new one.")
+    def save_profile_click():
+        """Save current settings. Edit the profile name in the box: same name overwrites, new name creates a new profile."""
+        name = profile_var.get().strip()
+        if not name or name == "(Last used)":
+            messagebox.showinfo("Profile", "Enter or select a profile name in the box, then click Save. Same name overwrites; new name creates a new profile.")
             return
-        save_profile(sel, _current_settings_dict())
-        refresh_profile_combo()
-        profile_var.set(sel)
-        messagebox.showinfo("Profile", f"Saved '{sel}'.")
-
-    def save_as_profile():
-        name = simpledialog.askstring("Save Profile", "Profile name (e.g. PLA, PETG, My Custom):", parent=root)
-        if not name or not name.strip():
-            return
-        name = name.strip()
         save_profile(name, _current_settings_dict())
         refresh_profile_combo()
         profile_var.set(name)
-        messagebox.showinfo("Profile", f"Saved as '{name}'.")
+        messagebox.showinfo("Profile", f"Saved '{name}'.")
 
     def delete_selected_profile():
         sel = profile_var.get().strip()
@@ -752,8 +813,7 @@ def create_gui() -> tk.Tk:
                 messagebox.showerror("Profile", "Could not delete profile (file not found).")
 
     ttk.Button(profile_frame, text="Load Profile", command=load_selected_profile).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(profile_frame, text="Save Profile", command=save_profile_to_selected).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(profile_frame, text="Save as Profile", command=save_as_profile).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(profile_frame, text="Save Profile", command=save_profile_click).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Button(profile_frame, text="Delete Profile", command=delete_selected_profile).pack(side=tk.LEFT)
 
     # --- G-code template (in separate tab) ---
@@ -807,7 +867,7 @@ def create_gui() -> tk.Tk:
     def _update_title(*_):
         v = version_override_var.get().strip()
         disp = v if v and v != "(use detected)" else __version__
-        root.title(f"P1S Auto-Clear v{disp} - NHDFARM-Style G-code Injector")
+        root.title(f"P1S Auto-Clear v{disp}")
     version_override_var.trace_add("write", _update_title)
 
     exp_frame = ttk.LabelFrame(settings_scroll, text="Export", padding=8)
@@ -833,21 +893,71 @@ def create_gui() -> tk.Tk:
     ttk.Button(imp_row, text="Browse...", command=_browse_import_dir).pack(side=tk.LEFT)
     ttk.Label(imp_frame, text="Watch folder for future auto-open: when a 3MF file is detected here, it will automatically load.", font=("", 8)).pack(anchor=tk.W)
 
+    git_frame = ttk.LabelFrame(settings_scroll, text="Git / GitHub", padding=8)
+    git_frame.pack(fill=tk.X, pady=(0, 8))
+    _repo_root = find_repo_root(Path(__file__).resolve().parent)
+    if _repo_root:
+        _br = current_branch(_repo_root) or "?"
+        git_info_var = tk.StringVar(value=f"Repository:\n{_repo_root}\nBranch: {_br}")
+    else:
+        git_info_var = tk.StringVar(value="No Git repository found next to the app.")
+    ttk.Label(git_frame, textvariable=git_info_var, font=("", 8), justify=tk.LEFT).pack(anchor=tk.W)
+
+    def _update_from_github():
+        repo = find_repo_root(Path(__file__).resolve().parent)
+        if not repo:
+            messagebox.showerror("Git", "Could not find a Git repository.", parent=root)
+            return
+        root.config(cursor="watch")
+        root.update_idletasks()
+        try:
+            ok, msg = update_from_github(repo)
+        except FileNotFoundError:
+            ok, msg = False, "Git executable not found. Install Git for Windows and ensure it is on PATH."
+        except subprocess.TimeoutExpired:
+            ok, msg = False, "Git command timed out."
+        except OSError as e:
+            ok, msg = False, str(e)
+        finally:
+            root.config(cursor="")
+        msg = (msg or "")[:4000]
+        if ok:
+            messagebox.showinfo("Update from GitHub", msg or "Done.", parent=root)
+        else:
+            messagebox.showerror("Update from GitHub", msg, parent=root)
+        r = find_repo_root(Path(__file__).resolve().parent)
+        if r:
+            br = current_branch(r) or "?"
+            git_info_var.set(f"Repository:\n{r}\nBranch: {br}")
+
+    ttk.Button(git_frame, text="Update from GitHub", command=_update_from_github).pack(anchor=tk.W, pady=(8, 0))
+    ttk.Label(
+        git_frame,
+        text=(
+            "Runs git fetch and git pull --ff-only (fast-forward only). "
+            "Uncommitted local changes are left as-is; fix conflicts in Git if pull fails."
+        ),
+        font=("", 8),
+        wraplength=520,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(4, 0))
+
     # Load last-used settings on startup
     last = load_last_settings()
     if last:
-            apply_settings_to_gui(
-                last,
-                cooldown_mode_var=cooldown_mode_var,
-                cooldown_time_var=cooldown_time_var,
-                cooldown_temp_var=cooldown_temp_var,
-                cooldown_hold_seconds_var=cooldown_hold_seconds_var,
-                push_height_mode_var=push_height_mode_var,
+        apply_settings_to_gui(
+            last,
+            cooldown_mode_var=cooldown_mode_var,
+            cooldown_time_var=cooldown_time_var,
+            cooldown_temp_var=cooldown_temp_var,
+            cooldown_hold_seconds_var=cooldown_hold_seconds_var,
+            push_height_mode_var=push_height_mode_var,
             push_height_mm_var=push_height_mm_var,
             push_height_offset_var=push_height_offset_var,
             bending_mode_var=bending_mode_var,
             push_mode_var=push_mode_var,
             loop_count_var=loop_count_var,
+            bed_level_interval_var=bed_level_interval_var,
             remove_purge_var=remove_purge_var,
             fans_during_cooldown_var=fans_during_cooldown_var,
             skip_retraction_between_loops_var=skip_retraction_between_loops_var,
@@ -873,22 +983,13 @@ def create_gui() -> tk.Tk:
     _update_title()  # Apply version to title after config load
 
     # --- Buttons (btn_frame already created and packed at bottom, above) ---
-    def _open_folder_in_explorer(folder_path: Path) -> None:
-        """Open the given folder in the system file manager."""
-        try:
-            if os.name == "nt":
-                os.startfile(str(folder_path))
-            elif platform.system() == "Darwin":
-                subprocess.run(["open", str(folder_path)], check=False)
-            else:
-                subprocess.run(["xdg-open", str(folder_path)], check=False)
-        except OSError:
-            pass
-
     def do_export():
         if not file_list_data:
             messagebox.showerror("Error", "Please add at least one 3MF file first.")
             return
+        sel = file_listbox.curselection()
+        if len(sel) == 1:
+            file_list_data[sel[0]]["settings"] = _dict_from_gui_for_file()
         paths = [Path(item["path"]) for item in file_list_data]
         for p in paths:
             if not p.exists():
@@ -908,8 +1009,10 @@ def create_gui() -> tk.Tk:
             push_height_offset_mm = 20  # unused when manual
         else:
             push_height_mm = 5
-            sweep_z = max(1.0, min(max_z, auto_sweep_z_var.get()))
-            push_height_offset_mm = max(1, int(max_z - sweep_z))
+            try:
+                push_height_offset_mm = max(1, int(push_height_offset_var.get().strip() or 20))
+            except (ValueError, AttributeError):
+                push_height_offset_mm = 20
 
         cooldown_mode = cooldown_mode_var.get()
         if cooldown_mode == "time":
@@ -954,6 +1057,18 @@ def create_gui() -> tk.Tk:
             return
 
         sweep_z = compute_sweep_z(max_z, push_height_mode, push_height_mm, push_height_offset_mm)
+        push_mode = push_mode_var.get()
+        if push_mode in (
+            "part_center",
+            "part_center_sweep",
+        ) and max_z is not None and max_z < PUSHER_MIN_HEIGHT_MM:
+            if not messagebox.askyesno(
+                "Warning",
+                f"Part height is {max_z:.1f} mm (below {PUSHER_MIN_HEIGHT_MM:.0f} mm).\n\n"
+                "Pusher cannot contact part at this height – you may need to remove it manually.",
+                icon="warning",
+            ):
+                return
         if sweep_z < 5:
             if not messagebox.askyesno(
                 "Warning",
@@ -976,7 +1091,38 @@ def create_gui() -> tk.Tk:
                 preheat_nozzle = 150
 
             input_for_process = path
-            if len(file_list_data) > 1:
+            if len(file_list_data) > 1 and chain_single_job_var.get():
+                default_params = {
+                    "cooldown_mode": cooldown_mode,
+                    "cooldown_value": cooldown_value,
+                    "cooldown_hold_seconds": cooldown_hold,
+                    "loop_count": 1,
+                    "remove_purge_line": remove_purge_var.get(),
+                    "fans_during_cooldown": fans_during_cooldown_var.get(),
+                    "skip_retraction_between_loops": skip_retraction_between_loops_var.get(),
+                    "reheat_between_loops": reheat_between_loops_var.get(),
+                    "preheat_bed_temp": preheat_bed,
+                    "preheat_nozzle_temp": preheat_nozzle,
+                    "push_height_mode": push_height_mode,
+                    "push_height_mm": push_height_mm,
+                    "push_height_offset_mm": push_height_offset_mm,
+                    "bending_mode": "nhdfarm" if bending_mode_var.get() == "on" else "none",
+                    "push_mode": push_mode_var.get(),
+                    "template": template or "",
+                }
+                result = str(
+                    merge_3mf_chain_files(
+                        [item["path"] for item in file_list_data],
+                        out_path,
+                        [item["settings"] for item in file_list_data],
+                        default_params,
+                        skip_retraction_between_jobs=skip_retraction_between_loops_var.get(),
+                        reheat_between_jobs=reheat_between_loops_var.get(),
+                        preheat_bed_temp=preheat_bed,
+                        preheat_nozzle_temp=preheat_nozzle,
+                    )
+                )
+            elif len(file_list_data) > 1:
                 with tempfile.NamedTemporaryFile(suffix=".3mf", delete=False) as tmp:
                     merge_3mf_files(
                         [item["path"] for item in file_list_data],
@@ -1119,6 +1265,14 @@ Requires pre-sliced 3MF: slice in Bambu Studio, save as .gcode.3mf, then
 load and Export from P1S Auto-Clear. Alternative: p1s-run-loop to send the
 job repeatedly via command line.
 
+MULTIPLE 3MF FILES
+------------------
+• **One continuous print** (checkbox under the file list, default ON): Exports
+  one job — print file 1, auto-clear, then file 2, etc., in a single plate gcode.
+  Use the same AMS slot / filament when possible; “Skip retraction between loops”
+  keeps filament loaded between jobs (like multi-loop).
+• **Unchecked**: Separate plates in one project (each plate is its own print in Bambu).
+
 SKIP NOZZLE LOAD LINE
 ---------------------
 Removes the nozzle load line (Bambu G-code section ;===== nozzle load line =====)
@@ -1131,18 +1285,20 @@ When enabled with multiple loops: filament stays loaded between loops (no
 retraction after loops 1..N-1); retraction only runs after the last loop.
 Saves time and avoids re-load/purge each loop. Use with "Skip nozzle load line"
 for best results.
+
+PUSH HEIGHT
 -----------
-• Auto (max height - X mm): Sweep at (max part height - offset) mm. Bambu
-  placeholder {max(5, max_layer_z - offset)} ensures minimum 5 mm clearance to
-  avoid bed damage. Larger offset = lower Z = push closer to bed. If the sweep
-  misses the part, try 25–30 mm offset.
+• Auto: Set offset (mm) subtracted from max part height for sweep Z. Larger
+  offset = lower sweep = closer to bed. If the sweep misses the part, try 25–30 mm.
 • Manual: Fixed Z height in mm (1–250). Use for known part heights.
 
 PUSH MODE
 ---------
 • center_only: Two pushes forward at center X (125 mm) only. No rake passes.
 • center_and_sweep: Center pushes + right-to-left rake passes (full Auto-Clear style).
-• bump: Single targeted push at part center and back (from mesh). Requires pip install p1s-autoclear[preview]. Falls back to bed center if mesh unavailable.
+• Part center: Push at each part center/back only (no rake). Requires trimesh.
+• Part center + sweep: Push at each part center plus rake passes. Requires trimesh.
+• Part center / + sweep: Footprint-only columns in safe X (32–206 mm); travel away from chute first.
 
 BENDING
 -------------------
@@ -1153,9 +1309,8 @@ Movement to flex the plate and help break adhesion before sweeps:
 PROFILES
 --------
 • Load Profile: Apply saved settings (filament type or custom).
-• Save Profile: Update the selected profile with current settings. For
-  built-in profiles (PLA, PETG, ABS/ASA), this saves a custom override.
-• Save as Profile: Create a new profile with a different name.
+• Save Profile: Edit the profile name in the box and click Save. Same name
+  overwrites; new name creates a new profile. Built-in names save custom overrides.
 • Delete Profile: Remove a custom profile. Built-in profiles cannot be
   deleted; custom profiles (including ones named the same as built-ins)
   can be deleted.
@@ -1204,8 +1359,7 @@ BUTTONS & FUNCTIONS
 • Reset Template: Restore the default G-code template.
 • Help: Open this help window.
 • Load Profile: Apply the selected profile’s settings.
-• Save Profile: Update the selected profile with current settings. For built-ins (PLA, PETG, ABS/ASA), saves a custom override.
-• Save as Profile: Create a new profile with a different name (e.g. PLA, PETG).
+• Save Profile: Edit the profile name in the box and click Save. Same name overwrites; new name creates a new profile.
 • Delete Profile: Remove a custom profile. Custom profiles can be deleted even if named the same as a built-in.
 
 EXPORT 3MF
@@ -1224,7 +1378,56 @@ Open in Bambu Studio, slice, and print. For looping, use:
         template_text.insert("1.0", DEFAULT_TEMPLATE.strip())
 
     ttk.Button(btn_frame, text="Reset Template", command=reset_template).pack(side=tk.LEFT, padx=(0, 10))
-    ttk.Button(btn_frame, text="Help", command=show_help).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(btn_frame, text="Help", command=show_help).pack(side=tk.LEFT, padx=(0, 10))
+
+    def do_restart():
+        save_last_settings(settings_to_dict(
+            cooldown_mode=cooldown_mode_var.get(),
+            cooldown_time=cooldown_time_var.get().strip(),
+            cooldown_temp=cooldown_temp_var.get().strip(),
+            cooldown_hold_seconds=cooldown_hold_seconds_var.get().strip(),
+            push_height_mode=push_height_mode_var.get(),
+            push_height_mm=push_height_mm_var.get().strip(),
+            push_height_offset_mm=push_height_offset_var.get().strip(),
+            bending_mode="nhdfarm" if bending_mode_var.get() == "on" else "none",
+            push_mode=push_mode_var.get(),
+            loop_count=loop_count_var.get().strip(),
+            remove_purge=remove_purge_var.get(),
+            fans_during_cooldown=fans_during_cooldown_var.get(),
+            skip_retraction_between_loops=skip_retraction_between_loops_var.get(),
+            reheat_between_loops=reheat_between_loops_var.get(),
+            preheat_bed_temp=preheat_bed_temp_var.get().strip(),
+            preheat_nozzle_temp=preheat_nozzle_temp_var.get().strip(),
+            template=template_text.get("1.0", tk.END).strip(),
+        ))
+        vov = version_override_var.get().strip()
+        save_app_config({
+            "default_export_path": default_export_path_var.get().strip(),
+            "open_export_folder_after_export": open_export_folder_var.get(),
+            "default_import_path": default_import_path_var.get().strip(),
+            "version_override": vov if vov and vov != "(use detected)" else "",
+        })
+        root.quit()
+        root.update()
+        os.execv(sys.executable, [sys.executable, "-m", "p1s_autoclear"])
+
+    def open_export_folder():
+        exp_dir = default_export_path_var.get().strip()
+        if exp_dir and Path(exp_dir).is_dir():
+            _open_folder_in_explorer(Path(exp_dir))
+            return
+        if file_list_data:
+            first_path = Path(file_list_data[0]["path"])
+            if first_path.parent.is_dir():
+                _open_folder_in_explorer(first_path.parent)
+                return
+        messagebox.showinfo(
+            "Open Export Folder",
+            "Set the export folder in Settings (Export section), or add a 3MF file first.",
+        )
+
+    ttk.Button(btn_frame, text="Restart", command=do_restart).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(btn_frame, text="Open Export Folder", command=open_export_folder).pack(side=tk.LEFT, padx=(0, 4))
 
     def on_closing():
         save_last_settings(settings_to_dict(

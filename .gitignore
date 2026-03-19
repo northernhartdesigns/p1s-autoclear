@@ -25,6 +25,9 @@ wheels/
 venv/
 ENV/
 
+# Local 3MF inspection (extract_3mf.py)
+*.3mf.extracted/
+
 # Testing
 .pytest_cache/
 .coverage

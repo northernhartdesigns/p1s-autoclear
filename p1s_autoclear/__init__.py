@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from .merge_3mf import merge_3mf_files
+from .merge_3mf import merge_3mf_chain_files, merge_3mf_files
 
 
 def get_sacrificial_3mf_path() -> Path:
@@ -21,4 +21,4 @@ def _get_version() -> str:
 
 __version__ = _get_version()
 
-__all__ = ["merge_3mf_files", "get_sacrificial_3mf_path", "__version__"]
+__all__ = ["merge_3mf_files", "merge_3mf_chain_files", "get_sacrificial_3mf_path", "__version__"]

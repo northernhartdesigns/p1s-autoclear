@@ -43,12 +43,19 @@ def get_plate_count(path: Path) -> int:
         return 1
 
 
+def _coerce_loop_count(raw: object, default: int = 1) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_loop_count_for_plate(settings: dict, plate_num: int, override: int | None) -> int:
     """Get loop count for a specific plate from plate_settings or top-level, or override."""
     if override is not None:
         return max(1, min(999, override))
     resolved = get_plate_settings(settings, plate_num, defaults=settings)
-    return max(1, min(999, int(resolved.get("loop_count", 1))))
+    return max(1, min(999, _coerce_loop_count(resolved.get("loop_count", 1))))
 
 
 def get_loop_count(path: Path, override: int | None) -> int:
@@ -59,7 +66,8 @@ def get_loop_count(path: Path, override: int | None) -> int:
         return max(1, min(999, override))
     if path.suffix.lower() in (".3mf", ".gcode.3mf"):
         settings = get_autoclear_settings(path)
-        return max(1, min(999, settings.get("loop_count", 1)))
+        n = _coerce_loop_count(settings.get("loop_count", 1))
+        return max(1, min(999, n))
     return 1
 
 
@@ -75,9 +83,9 @@ def get_bed_level_interval(path: Path, override: int | None) -> int:
     return 0
 
 
-def should_run_bed_leveling(run: int, loop_count: int, bed_level_interval: int) -> bool:
-    """True if bed leveling should run before this loop.
-    Always on loop 1. If interval > 0, also on loops N+1, 2N+1, ...
+def should_run_bed_leveling(run: int, bed_level_interval: int) -> bool:
+    """True if bed leveling should run before this global run.
+    Always on run 1. If interval > 0, also on runs N+1, 2N+1, ...
     """
     if run == 1:
         return True
@@ -235,7 +243,7 @@ def run_loop(
             print(f"Error uploading file: {result}", file=sys.stderr)
             printer.disconnect()
             sys.exit(1)
-        do_bed_level = should_run_bed_leveling(global_run, total_runs, bed_level_interval_val)
+        do_bed_level = should_run_bed_leveling(global_run, bed_level_interval_val)
         do_flow_calib = do_bed_level
         print("Uploaded. Starting print..." + (" (with bed leveling)" if do_bed_level else " (skip bed leveling)"))
         ok = _start_print_with_bed_level_control(

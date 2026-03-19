@@ -18,6 +18,6 @@ echo.
 echo ========================================
 echo  Done.
 echo  Run: python -m p1s_autoclear
-echo  Or double-click: Launch P1S Auto-Clear.bat
+echo  Or double-click: Launch P1S Auto-Clear.vbs (no console) or Launch P1S Auto-Clear.bat
 echo ========================================
 pause

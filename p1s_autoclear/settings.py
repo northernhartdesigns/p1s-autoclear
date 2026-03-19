@@ -135,11 +135,24 @@ def autoclear_to_gui_settings(autoclear: dict[str, Any]) -> dict[str, Any]:
     if "push_height_offset_mm" in autoclear:
         out["push_height_offset_mm"] = str(int(autoclear["push_height_offset_mm"]))
     if "bending_mode" in autoclear:
-        bm = str(autoclear["bending_mode"])
+        bm = str(autoclear["bending_mode"]).lower()
+        if bm == "z_pop":
+            bm = "none"
         out["bending_mode"] = "on" if bm in ("nhdfarm", "farmloop") else "off"
     if "push_mode" in autoclear:
         pm = str(autoclear["push_mode"])
-        out["push_mode"] = "center_and_sweep" if pm not in ("center_only", "center_and_sweep", "bump") else pm
+        if pm == "part_span":
+            pm = "part_center"
+        elif pm == "part_span_sweep":
+            pm = "part_center_sweep"
+        _pm_ok = (
+            "center_only",
+            "center_and_sweep",
+            "part_center",
+            "part_center_sweep",
+            "bump",
+        )
+        out["push_mode"] = "center_and_sweep" if pm not in _pm_ok else ("part_center" if pm == "bump" else pm)
     if "bed_level_interval" in autoclear:
         out["bed_level_interval"] = str(int(autoclear["bed_level_interval"]))
     # Legacy migration: push_heights -> push_height_mode "auto" or manual with first value
@@ -151,7 +164,7 @@ def autoclear_to_gui_settings(autoclear: dict[str, Any]) -> dict[str, Any]:
         else:
             out["push_height_mode"] = "auto"
             out["push_height_mm"] = "5"
-    # Legacy: use_plate_flex -> bending on (was z_pop) or off
+    # Legacy: use_plate_flex -> bending on (nhdfarm) or off
     if "bending_mode" not in out and "use_plate_flex" in autoclear:
         out["bending_mode"] = "on" if autoclear["use_plate_flex"] else "off"
     if "remove_purge_line" in autoclear:
@@ -238,11 +251,24 @@ def apply_settings_to_gui(
         except (ValueError, TypeError):
             push_height_offset_var.set("20")
     if bending_mode_var is not None and "bending_mode" in data:
-        bm = str(data["bending_mode"])
-        bending_mode_var.set("on" if bm in ("nhdfarm", "farmloop", "on") else "off")
+        bm = str(data["bending_mode"]).lower()
+        bending_mode_var.set(
+            "on" if bm in ("nhdfarm", "farmloop", "on") else "off"
+        )
     if push_mode_var is not None and "push_mode" in data:
         pm = str(data["push_mode"])
-        push_mode_var.set("center_and_sweep" if pm not in ("center_only", "center_and_sweep", "bump") else pm)
+        if pm == "part_span":
+            pm = "part_center"
+        elif pm == "part_span_sweep":
+            pm = "part_center_sweep"
+        _pm_ok = (
+            "center_only",
+            "center_and_sweep",
+            "part_center",
+            "part_center_sweep",
+            "bump",
+        )
+        push_mode_var.set("center_and_sweep" if pm not in _pm_ok else ("part_center" if pm == "bump" else pm))
     if bed_level_interval_var is not None and "bed_level_interval" in data:
         bed_level_interval_var.set(str(int(data["bed_level_interval"])))
     if template_text is not None and default_template:

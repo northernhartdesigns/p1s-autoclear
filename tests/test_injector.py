@@ -6,12 +6,72 @@ import pytest
 from p1s_autoclear.injector import (
     build_nhdfarm_sweep_block,
     build_injection_block,
+    chain_plate_segments,
     parse_temps_from_plate_gcode,
     remove_ams_load_from_gcode,
     remove_retraction_from_end_section,
     replace_m104_s0_in_end_section,
     wrap_plate_gcode_in_loops,
 )
+
+
+def test_part_center_block_same_as_center_only():
+    """part_center: same movement as center_only (one X, double push), part-relative."""
+    from p1s_autoclear.injector import build_part_center_footprint_block
+
+    g = build_part_center_footprint_block(
+        30.0, 70.0, 12.0, 55.0, 6.0, double_pass=False,
+    )
+    assert "Part center (same as center_only" in g
+    assert "central sweeps (2)" in g
+    assert "G1 X50.0" in g  # part center (30+70)/2, clamped
+    assert g.count("G1 Y250.0") == 2 and g.count("G1 Y0.0") == 2  # full bed back→front→back→front
+    assert "lift for travel" not in g and "safe approach" not in g
+    for x in range(0, 32):
+        assert f"G1 X{x}." not in g and f"G1 X{x} " not in g
+    assert "G1 X207" not in g and "G1 X220" not in g
+
+
+def test_compute_part_center_column_xs_clamps_left_part():
+    from p1s_autoclear.injector import PART_CENTER_X_SAFE_MIN, compute_part_center_column_xs
+
+    xs = compute_part_center_column_xs(8.0, 18.0, False)
+    assert all(PART_CENTER_X_SAFE_MIN <= x <= 206 for x in xs)
+    assert len(xs) >= 1
+
+
+def test_build_injection_block_expanded_part_center_sweep():
+    from p1s_autoclear.injector import build_injection_block_expanded
+
+    out = build_injection_block_expanded(
+        max_layer_z=10.0,
+        cooldown_mode="time",
+        cooldown_value=1.0,
+        push_mode="part_center_sweep",
+        push_height_mode="manual",
+        push_height_mm=6.0,
+        part_xy_extents=(40.0, 90.0, 15.0, 60.0),
+    )
+    assert "Part center (same as center_only" in out
+    assert "pass 2" in out.lower()
+    assert "G1 X220" not in out
+
+
+def test_chain_plate_segments_two_jobs():
+    """Chain joins segments; first job end retract stripped when skip_retraction True."""
+    end = "; MACHINE_END_GCODE_START\nM400\nG10\nM17 S\n"
+    s1 = "; JOB1\n; CHANGE_LAYER\ng1 x1\n" + end
+    s2 = "; JOB2\n; CHANGE_LAYER\ng1 x2\n" + end
+    out = chain_plate_segments(
+        [s1, s2],
+        skip_retraction_between_jobs=True,
+        reheat_between_jobs=False,
+    )
+    assert "CHAINED JOB 2 OF 2" in out
+    assert "M17 R" in out
+    split = out.find("CHAINED JOB 2")
+    assert "G10" not in out[:split]
+    assert "G10" in out[split:]
 
 
 def test_build_nhdfarm_sweep_block_auto():
@@ -43,7 +103,7 @@ def test_build_nhdfarm_sweep_block_manual():
     assert "G1 Z5 F12000" in result
 
 
-def test_build_nhdfarm_sweep_block_center_only():
+def test_build_nhdfarm_sweep_block_center_only_no_rake():
     """push_mode center_only: two central pushes only, no rake passes."""
     result = build_nhdfarm_sweep_block(
         push_height_mode="manual", push_height_mm=5, push_mode="center_only"
@@ -89,6 +149,14 @@ def test_build_nhdfarm_sweep_block_center_and_sweep():
     assert "rake (pass 2)" in result
 
 
+def test_build_bending_block_z_pop_removed_maps_to_none():
+    """Legacy z_pop is normalized to no bending block."""
+    from p1s_autoclear.injector import build_bending_block, normalize_bending_mode
+
+    assert normalize_bending_mode("z_pop") == "none"
+    assert build_bending_block("z_pop") == ""
+
+
 def test_build_injection_block_no_g28_z_matches_autoclear():
     """End section matches Auto-Clear: safe corner only, no G28 Z command (avoids Z homing failure)."""
     result = build_injection_block(
@@ -102,21 +170,38 @@ def test_build_injection_block_no_g28_z_matches_autoclear():
     assert not re.search(r"^\s*G28\s+Z\b", result, re.MULTILINE), "Should not emit G28 Z command"
 
 
-def test_build_injection_block_bump_mode():
-    """push_mode bump: single targeted push at part center/back."""
+def test_build_injection_block_part_center_mode():
+    """push_mode part_center: same as center_only at part center (one X, double push), no rake."""
     result = build_injection_block(
         cooldown_mode="temp",
         cooldown_value=40,
         push_height_mode="manual",
         push_height_mm=5,
-        push_mode="bump",
-        part_bounds=(60.0, 120.0),
+        push_mode="part_center",
+        part_bounds_list=[(60.0, 120.0)],
     )
-    assert "targeted bump" in result
-    assert "G1 X60.0 Y120.0" in result
-    assert "G1 Y0" in result
-    assert "rake (pass 1)" in result
-    assert "rake (pass 2)" in result
+    assert "Part center (same as center_only" in result
+    assert "central sweeps (2)" in result
+    assert "G1 X60.0" in result  # part center from (38,82)
+    assert "G1 Y250.0" in result or "G1 Y250" in result  # full bed back
+    assert "G1 X220" not in result
+    assert "rake (pass 1)" not in result
+
+
+def test_build_injection_block_part_center_sweep_mode():
+    """push_mode part_center_sweep: same as part_center with second pass at F12000."""
+    result = build_injection_block(
+        cooldown_mode="temp",
+        cooldown_value=40,
+        push_height_mode="manual",
+        push_height_mm=5,
+        push_mode="part_center_sweep",
+        part_bounds_list=[(60.0, 120.0)],
+    )
+    assert "Part center (same as center_only" in result
+    assert "Part center pass 2" in result
+    assert "F3000" in result and "F12000" in result
+    assert "G1 X220" not in result
 
 
 def test_build_injection_block_has_xy_park():
@@ -212,7 +297,7 @@ def test_build_injection_block_fans_off_after_first_push():
 
 
 def test_build_injection_block_reheat_between_loops_true_loop_count_2():
-    """Preheat is never in the injection block; it is added by wrap_plate_gcode_in_loops between loops only."""
+    """Preheat (M140/M104) is emitted after first push in sweeps when reheat + loop_count > 1."""
     result = build_injection_block(
         cooldown_mode="temp",
         cooldown_value=40,
@@ -224,9 +309,15 @@ def test_build_injection_block_reheat_between_loops_true_loop_count_2():
         preheat_nozzle_temp=220,
         loop_count=2,
     )
-    # Preheat at sweep start when reheat + loop_count > 1; heaters off at end always
+    # Preheat after first push when reheat + loop_count > 1; heaters off at end always
     assert "M140 S60" in result  # preheat bed
     assert "M104 S220" in result  # preheat nozzle
+    # Reheat must come after central sweeps (first push), before rake
+    central_sweeps = "; -------- central sweeps (2) --------"
+    rake_marker = "; -------- extended right-to-left rake (pass 1) --------"
+    first_m140 = result.index("M140 S60")
+    assert first_m140 > result.index(central_sweeps)
+    assert first_m140 < result.index(rake_marker)
     assert "M140 S0" in result  # heaters off at end
     assert "M104 S0" in result
 

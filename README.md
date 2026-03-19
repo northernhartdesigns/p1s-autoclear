@@ -8,12 +8,13 @@ NHDFARM-style G-code injection for Bambu Lab P1S (and P1P/X1C) automation. Injec
 - **Time-based cooldown**: Wait N seconds (G4) before pushing
 - **Temperature-based cooldown**: Wait until bed cools to X°C (M190)
 - **Push height**: Auto (max part height minus offset, 5–50 mm) or Manual (fixed mm). Minimum 5 mm clearance: `max(5, max_layer_z - offset)` prevents bed damage on short parts
-- **Bending modes**: NHDFARM (Z235↔Z200 ×6), z_pop, or none – helps break adhesion before sweeps
+- **Bending modes**: NHDFARM (Z235↔Z200 ×6) or none – helps break adhesion before sweeps
+- **Part center / Part center + sweep**: Same movement as **center_only** (one line at part center, double push back→front→back→front). X = part center (**clamped 32–206 mm**); Y uses **full bed** (back 250 mm → front 0) so the part is pushed out. Part center + sweep runs the same sequence twice (second pass at higher speed).
 - **End section (match Auto-Clear)**: XY park (X65 Y265), fans off, M400—no G28 Z (Auto-Clear skips Z homing after sweeps to avoid Z axis homing failure)
-- **Z-height caution**: Bambu default printable height is 250 mm (not 256 mm; 6 mm reserved for z-hop/debris). NHDFARM bending uses Z235, which is close to that limit—debris or dust caps can cause roof collision. Use bending "none" or "z_pop" if you see grinding or collision. See [Bambu Lab: Print volume limitations](https://wiki.bambulab.com/en/knowledge-sharing/print-volume-limitations)
+- **Z-height caution**: Bambu default printable height is 250 mm (not 256 mm; 6 mm reserved for z-hop/debris). NHDFARM bending uses Z235, which is close to that limit—debris or dust caps can cause roof collision. Use bending **none** if you see grinding or collision. See [Bambu Lab: Print volume limitations](https://wiki.bambulab.com/en/knowledge-sharing/print-volume-limitations)
 - **Editable G-code template**: Customize the injection block (placeholders: `{cooldown}`, `{bending}`, `{sweeps}`)
 - **Loop count**: Set how many times to run the project (1–999), stored in 3MF metadata
-- **Multi-file merge**: Add multiple 3MF files, configure per-file settings (cooldown, loops), export one merged 3MF
+- **Multi-file merge**: Add multiple sliced 3MFs — **one continuous print** (default): job 1 → auto-clear → job 2 → … in a single `plate_1.gcode`. Or uncheck “One continuous print” for separate Bambu plates. Per-file **Settings** still applies (cooldown, loops per job).
 - **Remove purge line**: Option to remove the filament purge line (orange line at front of bed) from start G-code
 - **Run Loop script**: Automatically send the job to your P1S, wait for completion, and repeat (supports multi-plate)
 
@@ -41,7 +42,7 @@ cd p1s-autoclear
 pip install -e .
 ```
 
-Or run directly without installing (bump mode requires `pip install trimesh`):
+Or run directly without installing (Part center mode requires `pip install trimesh`):
 
 ```bash
 cd p1s-autoclear

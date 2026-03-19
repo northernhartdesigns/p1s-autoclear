@@ -124,14 +124,15 @@ def set_machine_end_gcode(config: dict, value: str) -> None:
 
 def serialize_config(config: dict, original_bytes: bytes) -> bytes:
     """Serialize the config dict back to bytes for writing into the 3MF.
-    Infers format from original_bytes: JSON for Bambu, falls back to JSON
-    if INI (preserves machine_end_gcode changes in a compatible way).
+
+    When the original file is JSON (Bambu Studio), output is JSON with the same
+    structure. When the original is PrusaSlicer INI text, we still emit JSON here
+    (INI round-trip is not implemented); avoid relying on this for Prusa projects
+    or re-serialize only JSON machine_settings in the archive.
     """
     try:
-        parsed = json.loads(original_bytes.decode("utf-8"))
-        # Original was JSON
+        json.loads(original_bytes.decode("utf-8"))
         return json.dumps(config, indent=4, ensure_ascii=False).encode("utf-8")
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
-    # Fallback: assume we only modified machine_end_gcode, try to preserve format
     return json.dumps(config, indent=4, ensure_ascii=False).encode("utf-8")

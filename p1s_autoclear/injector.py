@@ -10,6 +10,26 @@ from .config_discovery import ANCHOR_BEFORE_M17, FALLBACK_ANCHOR
 # Minimum sweep Z above bed (mm). Prevents toolhead/nozzle from digging into bed.
 MIN_SWEEP_Z_MM = 5.0
 
+# Pusher clip ~2 mm above nozzle. Parts < 3 mm: pusher cannot contact. 3–5 mm: use 1 mm.
+PUSHER_MIN_HEIGHT_MM = 3.0  # Below this, pusher method ineffective
+PUSHER_SHORT_PART_Z_MM = 1.0  # For 3–5 mm parts: nozzle ~1 mm, pusher ~3 mm
+PUSHER_UNSAFE_Z_MM = 5.0  # For < 3 mm: safe Z, pusher won't push (remove manually)
+
+
+def _compute_auto_push_z(max_layer_z: float, push_height_offset_mm: int) -> float:
+    """
+    Auto push height from bed. Pusher clip ~2 mm above nozzle.
+    < 3 mm: pusher cannot contact part -> safe Z (5 mm), remove manually.
+    3–5 mm: use 1 mm (pusher ~3 mm contacts part).
+    >= 5 mm: normal formula (max_layer_z - offset), min 1 mm.
+    """
+    if max_layer_z < PUSHER_MIN_HEIGHT_MM:
+        return PUSHER_UNSAFE_Z_MM
+    if max_layer_z < 5.0:
+        return PUSHER_SHORT_PART_Z_MM
+    offset = max(5, min(50, int(push_height_offset_mm)))
+    return max(1.0, max_layer_z - offset)
+
 
 def build_cooldown_line(mode: str, value: float, temp_hold_seconds: float = 60) -> str:
     """Build cooldown G-code lines.
@@ -30,15 +50,23 @@ def build_cooldown_line(mode: str, value: float, temp_hold_seconds: float = 60) 
     return ""
 
 
+def normalize_bending_mode(mode: str) -> str:
+    """Map legacy/removed modes to supported bending_mode values (nhdfarm, none)."""
+    m = str(mode).strip().lower()
+    if m == "z_pop":
+        return "none"
+    return str(mode)
+
+
 def build_bending_block(mode: str) -> str:
     """Build bending motion block that runs before pusher sweeps.
     Flexes the plate to help break adhesion before sweeping.
     mode 'nhdfarm': Z235↔Z200 repeated 6 times.
     CAUTION: Z235 is near Bambu's 250 mm printable limit; debris or dust caps
     can cause roof collision. See Bambu Lab wiki on print volume limitations.
-    mode 'z_pop': reduce Z current, lift near part top, drop (Bambu-style).
     mode 'none' or other: returns empty string.
     """
+    mode = normalize_bending_mode(mode)
     if mode == "nhdfarm":
         # Z235 is near Bambu's 250mm default limit. See roof collision warning in Help.
         # Ref: https://wiki.bambulab.com/en/knowledge-sharing/print-volume-limitations
@@ -47,79 +75,48 @@ def build_bending_block(mode: str) -> str:
             lines.append("G1 Z235 F12000")
             lines.append("G1 Z200 F12000")
         return "\n".join(lines)
-    if mode == "z_pop":
-        return "\n".join([
-            "; Plate flex (Z pop: helps break adhesion before sweep)",
-            "M17 Z0.4 ; reduce Z holding current",
-            "G1 Z{max_layer_z + 5} F600",
-            "G1 Z{max_layer_z + 3}",
-            "M400",
-            "M17 R ; restore Z current",
-        ])
     return ""
 
 
-# Bed center fallback when mesh unavailable for bump mode
+# Bed center fallback
 BED_CENTER_X = 125.0
 BED_BACK_Y = 250.0
 
+# Part center sweeps: stay inside this X band (clips left ~18mm; avoid high-X motor stress)
+PART_CENTER_X_SAFE_MIN = 32.0
+PART_CENTER_X_SAFE_MAX = 206.0
+# Y toward chute / machine front (Bambu: smaller Y). Same as full-bed sweep for max eject.
+PART_CENTER_Y_PUSH_FRONT = 0.0
 
-def build_bump_block(
-    center_x: float,
-    back_y: float,
-    z_expr: str,
-    y_front: float = 0,
-    y_back: float = 250,
-    speed_push: int = 3000,
-    speed_sweep: int = 3000,
-    speed_rake_fast: int = 12000,
-    x_positions: tuple[float, ...] = (220, 190, 160, 130, 100, 70, 30),
-    fans_off_after_first_push: str = "",
-) -> str:
-    """
-    Targeted bump at part center/back, then rake passes (same as center_and_sweep).
-    Positions at (center_x, back_y), one bump forward, then right-to-left rake (2 passes).
-    When fans_off_after_first_push is set, inserts it after the first bump (maximize cooldown).
-    """
 
-    def rake_pass(speed: int) -> list[str]:
-        out = []
-        for x in x_positions:
-            out.append(f"G1 Y{y_back} F{speed}")
-            out.append(f"G1 X{x} F{speed}")
-            out.append(f"G1 Y{y_front} F{speed}")
-        return out
+def _clamp_part_center_x(x: float) -> float:
+    return max(PART_CENTER_X_SAFE_MIN, min(PART_CENTER_X_SAFE_MAX, x))
 
-    lines = [
-        "; -------- choose sweep height ----------",
-        f"G1 Z{z_expr} F10000",
-        "M400",
-        "",
-        "; -------- targeted bump at part center/back --------",
-        f"G1 X{center_x:.1f} Y{back_y:.1f} F{speed_push}",
-        f"G1 Y{y_front} F{speed_push}",
-        "",
-    ]
-    if fans_off_after_first_push:
-        lines.append(fans_off_after_first_push)
-        lines.append("")
-    lines.extend([
-        "; -------- extended right-to-left rake (pass 1) --------",
-        *rake_pass(speed_sweep),
-        "",
-        "; ---------- choose sweep height ----------",
-        f"G1 Y{y_back} F{speed_sweep}",
-        "M400",
-        f"G1 X{x_positions[0]} F{speed_sweep}",
-        "M400",
-        "",
-        f"G1 Z{z_expr} F12000",
-        "M400",
-        "",
-        "; -------- extended right-to-left rake (pass 2) --------",
-        *rake_pass(speed_rake_fast),
-    ])
-    return "\n".join(lines)
+
+def compute_part_center_column_xs(xmin: float, xmax: float, double_pass: bool) -> list[float]:
+    """Sweep columns from part footprint, clamped to safe X; order L→R or R→L by bed side."""
+    cx = (xmin + xmax) * 0.5
+    span = max(xmax - xmin, 0.5)
+    margin = max(1.5, min(5.0, span * 0.06))
+    lx = _clamp_part_center_x(xmin + margin)
+    rx = _clamp_part_center_x(xmax - margin)
+    if lx > rx + 0.01:
+        col_xs = [_clamp_part_center_x(cx)]
+    elif double_pass:
+        w = rx - lx
+        n = max(3, min(10, 2 + int(w / 20.0)))
+        col_xs = [_clamp_part_center_x(lx + w * i / max(n - 1, 1)) for i in range(n)]
+    else:
+        col_xs = [lx, rx] if (rx - lx) > 4.0 else [_clamp_part_center_x(cx)]
+    seen: set[float] = set()
+    out: list[float] = []
+    for x in col_xs:
+        xr = round(x, 2)
+        if xr not in seen:
+            seen.add(xr)
+            out.append(xr)
+    out.sort(reverse=cx >= BED_CENTER_X)
+    return out
 
 
 def build_nhdfarm_sweep_block(  # noqa: D213
@@ -134,11 +131,13 @@ def build_nhdfarm_sweep_block(  # noqa: D213
     x_positions: tuple[float, ...] = (220, 190, 160, 130, 100, 70, 30),
     x_central: float = 125,
     fans_off_after_first_push: str = "",
+    reheat_after_first_push: str = "",
 ) -> str:
     """
     NHDFARM-style sweep (mirror Auto-Clear): central sweeps + optional double rake pass.
     push_mode 'center_only': two pushes at center X only (no rake).
     push_mode 'center_and_sweep': central sweeps + rake pass 1 at F3000, rake pass 2 at F12000.
+    reheat_after_first_push: M140/M104 to preheat bed/nozzle when first push happens (reheat between loops).
     """
     if push_height_mode == "auto":
         offset = max(1, min(249, int(push_height_offset_mm)))  # Placeholder: max_layer_z unknown
@@ -169,6 +168,9 @@ def build_nhdfarm_sweep_block(  # noqa: D213
         f"G1 Y{y_front} F{speed_sweep}",
         "",
     ]
+    if reheat_after_first_push:
+        lines.append(reheat_after_first_push)
+        lines.append("")
     if fans_off_after_first_push:
         lines.append(fans_off_after_first_push)
         lines.append("")
@@ -206,11 +208,9 @@ def build_nhdfarm_sweep_block_expanded(
     max_layer_z from plate header; no Bambu placeholders.
     """
     if push_height_mode == "auto":
-        offset = max(5, min(50, int(push_height_offset_mm)))
-        z_val = max(0.0, max_layer_z - offset)  # Allow <5mm (user warned); 0 prevents negative Z
+        z_val = _compute_auto_push_z(max_layer_z, int(push_height_offset_mm))
     else:
         z_val = push_height_mm
-    z_str = f"{z_val:.2f}"
     return build_nhdfarm_sweep_block(
         push_height_mode="manual",
         push_height_mm=float(z_val),
@@ -236,12 +236,13 @@ def build_injection_block_expanded(
     loop_count: int = 1,
     *,
     cooldown_hold_seconds: float = 60,
-    part_bounds: tuple[float, float] | None = None,
+    part_bounds_list: list[tuple[float, float]] | None = None,
+    part_xy_extents: tuple[float, float, float, float] | None = None,
 ) -> str:
     """
     Build auto-clear block with concrete values for injection into plate gcode.
     Same as build_injection_block but sweep Z is expanded (no placeholders).
-    When push_mode is 'bump', uses part_bounds (center_x, back_y) from mesh; falls back to bed center if None.
+    part_center modes use part_xy_extents (gcode bbox) for footprint sweeps within safe X.
     """
     cooldown_line = build_cooldown_line(cooldown_mode, cooldown_value, temp_hold_seconds=cooldown_hold_seconds)
     if fans_during_cooldown:
@@ -252,21 +253,43 @@ def build_injection_block_expanded(
             + cooldown_line
         )
     bending = build_bending_block(bending_mode)
-    if push_mode == "bump":
-        cx, cy = part_bounds or (BED_CENTER_X, BED_BACK_Y)
+    reheat_after_first_push = ""
+    if reheat_between_loops and loop_count > 1:
+        reheat_after_first_push = (
+            f"M140 S{preheat_bed_temp} ; preheat bed for next print\n"
+            f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next print"
+        )
+    if push_mode in ("part_center", "part_center_sweep"):
         if push_height_mode == "auto":
-            offset = max(5, min(50, int(push_height_offset_mm)))
-            z_val = max(0.0, max_layer_z - offset)
+            z_val = _compute_auto_push_z(max_layer_z, int(push_height_offset_mm))
         else:
             z_val = max(1.0, push_height_mm)
+        short_note = (
+            "; Part < 3 mm: pusher cannot contact - remove manually"
+            if max_layer_z < PUSHER_MIN_HEIGHT_MM and z_val >= PUSHER_UNSAFE_Z_MM
+            else ""
+        )
         fans_off_blk = (
             "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
             if fans_during_cooldown
             else ""
         )
-        sweeps = build_bump_block(
-            center_x=cx, back_y=cy, z_expr=f"{z_val:.2f}",
+        ex = part_xy_extents
+        if ex is None and part_bounds_list:
+            cx, by = part_bounds_list[0]
+            ex = (cx - 22.0, cx + 22.0, max(4.0, by - 48.0), by)
+        xmin, xmax, ymin, ymax = ex or (
+            BED_CENTER_X - 18.0,
+            BED_CENTER_X + 18.0,
+            8.0,
+            180.0,
+        )
+        sweeps = build_part_center_footprint_block(
+            xmin, xmax, ymin, ymax, z_val,
+            double_pass=push_mode == "part_center_sweep",
             fans_off_after_first_push=fans_off_blk,
+            reheat_after_first_push=reheat_after_first_push,
+            short_part_note=short_note,
         )
     else:
         fans_off_blk = (
@@ -281,6 +304,7 @@ def build_injection_block_expanded(
             push_height_offset_mm=push_height_offset_mm,
             push_mode=push_mode,
             fans_off_after_first_push=fans_off_blk,
+            reheat_after_first_push=reheat_after_first_push,
         )
     template = template or DEFAULT_TEMPLATE
     if "{bending}" not in template and "{sweeps}" in template:
@@ -301,13 +325,8 @@ def build_injection_block_expanded(
         raise ValueError(f"Template missing: {', '.join(missing)}")
     # Fans off is now embedded in sweeps (after first push) when fans_during_cooldown; keep template placeholder empty
     fans_off_before_sweep = ""
-    # Preheat at sweep start: when reheat_between_loops and loop_count > 1, start heating during push
+    # Reheat is embedded in sweeps (after first push) when reheat_between_loops; keep template placeholder empty
     preheat = ""
-    if reheat_between_loops and loop_count > 1:
-        preheat = (
-            f"M140 S{preheat_bed_temp} ; preheat bed for next print\n"
-            f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next print"
-        )
     heaters_off = "M140 S0 ; bed off\nM104 S0 ; nozzle off"
     fans_off = (
         "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
@@ -331,7 +350,6 @@ def parse_max_z_from_plate_gcode(gcode: str) -> float | None:
     Format: ; max_z_height: 5.20
     Returns None if not found.
     """
-    import re
     m = re.search(r";\s*max_z_height\s*:\s*([\d.]+)", gcode, re.IGNORECASE)
     if m:
         try:
@@ -339,6 +357,123 @@ def parse_max_z_from_plate_gcode(gcode: str) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _gcode_print_section_xy_pairs(gcode: str) -> tuple[list[float], list[float]] | None:
+    """Collect X,Y from G0/G1 in print section (after first layer, before MACHINE_END)."""
+    xs: list[float] = []
+    ys: list[float] = []
+    lines = gcode.splitlines()
+    start = 0
+    for i, ln in enumerate(lines):
+        if "; CHANGE_LAYER" in ln or re.match(r";\s*layer num/", ln, re.IGNORECASE):
+            start = i
+            break
+    end = len(lines)
+    for i, ln in enumerate(lines):
+        if "; MACHINE_END_GCODE" in ln:
+            end = i
+            break
+    for line in lines[start:end]:
+        line = line.split(";")[0].strip()
+        if not re.match(r"^G[01]\b", line, re.IGNORECASE):
+            continue
+        x_m = re.search(r"\bX([-\d.]+)", line, re.IGNORECASE)
+        y_m = re.search(r"\bY([-\d.]+)", line, re.IGNORECASE)
+        if x_m and y_m:
+            try:
+                x, y = float(x_m.group(1)), float(y_m.group(1))
+            except ValueError:
+                continue
+            if 0 <= x <= 256 and 0 <= y <= 256:
+                xs.append(x)
+                ys.append(y)
+    if not xs or not ys:
+        return None
+    return xs, ys
+
+
+def get_part_bounds_from_gcode(gcode: str) -> list[tuple[float, float]] | None:
+    """
+    Extract (center_x, back_y) from plate gcode XY moves for Part center push fallback.
+    """
+    pts = _gcode_print_section_xy_pairs(gcode)
+    if not pts:
+        return None
+    xs, ys = pts
+    return [((min(xs) + max(xs)) / 2, max(ys))]
+
+
+def get_part_xy_extents_from_gcode(gcode: str) -> tuple[float, float, float, float] | None:
+    """
+    Bounding box of print moves: xmin, xmax, ymin, ymax (bed coords; Y front = smaller).
+    Used for part_center / part_center_sweep footprint sweeps.
+    """
+    pts = _gcode_print_section_xy_pairs(gcode)
+    if not pts:
+        return None
+    xs, ys = pts
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def build_part_center_footprint_block(
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    z_val: float,
+    *,
+    double_pass: bool,
+    fans_off_after_first_push: str = "",
+    reheat_after_first_push: str = "",
+    short_part_note: str = "",
+    speed_pass1: int = 3000,
+    speed_pass2: int = 12000,
+) -> str:
+    """
+    Part center: same movement as center_only (one X, double push back→front→back→front),
+    but part-relative X only: X = part center clamped 32–206. Y uses full bed: back = BED_BACK_Y (250), front = 0.
+    """
+    part_center_x = _clamp_part_center_x((xmin + xmax) * 0.5)
+    y_back = BED_BACK_Y
+    y_front = float(PART_CENTER_Y_PUSH_FRONT)
+
+    lines = ["; -------- Part center (same as center_only, part-relative) ----------"]
+    if short_part_note:
+        lines.append(short_part_note)
+    lines.extend(
+        [
+            "; -------- choose sweep height ----------",
+            f"G1 Z{z_val:.2f} F10000",
+            "M400",
+            "",
+            "; -------- central sweeps (2) --------",
+            f"G1 X{part_center_x:.1f} F{speed_pass1}",
+            f"G1 Y{y_back:.1f} F{speed_pass1}",
+            f"G1 Y{y_front:.1f} F{speed_pass1}",
+            f"G1 Y{y_back:.1f} F{speed_pass1}",
+            f"G1 Y{y_front:.1f} F{speed_pass1}",
+            "",
+        ]
+    )
+    if double_pass:
+        lines.extend(
+            [
+                "; -------- Part center pass 2 --------",
+                f"G1 Y{y_back:.1f} F{speed_pass2}",
+                f"G1 Y{y_front:.1f} F{speed_pass2}",
+                f"G1 Y{y_back:.1f} F{speed_pass2}",
+                f"G1 Y{y_front:.1f} F{speed_pass2}",
+                "",
+            ]
+        )
+    if reheat_after_first_push:
+        lines.append(reheat_after_first_push)
+        lines.append("")
+    if fans_off_after_first_push:
+        lines.append(fans_off_after_first_push)
+        lines.append("")
+    return "\n".join(lines)
 
 
 def parse_temps_from_plate_gcode(gcode: str) -> tuple[int | None, int | None]:
@@ -498,12 +633,12 @@ def build_injection_block(
     cooldown_hold_seconds: float = 60,
     push_heights: list[float] | None = None,
     use_plate_flex: bool | None = None,
-    part_bounds: tuple[float, float] | None = None,
+    part_bounds_list: list[tuple[float, float]] | None = None,
 ) -> str:
     """
     Build the full injection block from config.
     New params: push_height_mode, push_height_mm, bending_mode.
-    Legacy params (push_heights, use_plate_flex) used for backward compat when new absent.
+    Legacy params (push_heights, use_plate_flex ignored for bending) for old templates.
     cooldown_hold_seconds: extra seconds to wait after bed reaches target temp (temp mode only).
     """
     cooldown_line = build_cooldown_line(
@@ -516,9 +651,9 @@ def build_injection_block(
             "M106 P3 S255 ; chamber fan 100%\n"
             + cooldown_line
         )
-    # Legacy: use_plate_flex or push_heights list
+    # Legacy: push_heights list (z_pop / use_plate_flex bending removed)
     if push_heights is not None and len(push_heights) > 0:
-        bending = build_bending_block("z_pop") if use_plate_flex else ""
+        bending = ""
         sweeps = build_sweep_block(
             push_heights,
             x_pos=128,
@@ -530,20 +665,33 @@ def build_injection_block(
         )
     else:
         bending = build_bending_block(bending_mode)
-        if push_mode == "bump":
-            cx, cy = part_bounds or (BED_CENTER_X, BED_BACK_Y)
+        reheat_after_first_push = ""
+        if reheat_between_loops and loop_count > 1:
+            reheat_after_first_push = (
+                f"M140 S{preheat_bed_temp} ; preheat bed for next print\n"
+                f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next print"
+            )
+        if push_mode in ("part_center", "part_center_sweep"):
+            z_num = 8.0
             if push_height_mode == "auto":
-                offset = max(1, min(249, int(push_height_offset_mm)))
-                z_expr = f"{{max(1, max_layer_z - {offset})}}"
+                z_num = max(1.0, 10.0 - push_height_offset_mm * 0.1)
             else:
-                z_expr = str(max(1.0, push_height_mm))
+                z_num = max(1.0, push_height_mm)
             fans_off_blk = (
                 "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
                 if fans_during_cooldown else ""
             )
-            sweeps = build_bump_block(
-                center_x=cx, back_y=cy, z_expr=z_expr,
+            if part_bounds_list:
+                cx, by = part_bounds_list[0]
+                ex = (cx - 22.0, cx + 22.0, max(4.0, by - 48.0), by)
+            else:
+                ex = (BED_CENTER_X - 18.0, BED_CENTER_X + 18.0, 8.0, 180.0)
+            xmin, xmax, ymin, ymax = ex
+            sweeps = build_part_center_footprint_block(
+                xmin, xmax, ymin, ymax, z_num,
+                double_pass=push_mode == "part_center_sweep",
                 fans_off_after_first_push=fans_off_blk,
+                reheat_after_first_push=reheat_after_first_push,
             )
         else:
             fans_off_blk = (
@@ -556,6 +704,7 @@ def build_injection_block(
                 push_height_offset_mm=push_height_offset_mm,
                 push_mode=push_mode,
                 fans_off_after_first_push=fans_off_blk,
+                reheat_after_first_push=reheat_after_first_push,
             )
     template = template or DEFAULT_TEMPLATE
     # Backward compat: old templates use {plate_flex}, new use {bending}
@@ -579,13 +728,8 @@ def build_injection_block(
         raise ValueError(f"G-code template missing required placeholder(s): {', '.join(missing)}")
     # Fans off now embedded in sweeps (after first push) when fans_during_cooldown.
     fans_off_before_sweep = ""
-    # Preheat at sweep start: when reheat_between_loops and loop_count > 1, start heating during push
+    # Reheat is embedded in sweeps (after first push) when reheat_between_loops.
     preheat = ""
-    if reheat_between_loops and loop_count > 1:
-        preheat = (
-            f"M140 S{preheat_bed_temp} ; preheat bed for next print\n"
-            f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next print"
-        )
     heaters_off = "M140 S0 ; bed off\nM104 S0 ; nozzle off"
     fans_off = (
         "M107 ; part cooling off\nM107 P2 ; aux off\nM107 P3 ; chamber off"
@@ -796,6 +940,63 @@ def wrap_plate_gcode_in_loops(
             parts.append(f"G4 S{int(pause_seconds)} ; brief pause between loops")
             parts.append("")
     return sep.join(parts)
+
+
+def _modify_from_last_executable_end(gcode: str, transform) -> str:
+    """
+    Apply transform(tail) only to the substring from the last
+    ; MACHINE_END_GCODE_START through end of file (one job's tail).
+    """
+    pos = gcode.rfind(_EXECUTABLE_END_MARKER)
+    if pos < 0:
+        return gcode
+    return gcode[:pos] + transform(gcode[pos:])
+
+
+def chain_plate_segments(
+    segments: list[str],
+    *,
+    skip_retraction_between_jobs: bool = True,
+    reheat_between_jobs: bool = False,
+    preheat_bed_temp: int = 70,
+    preheat_nozzle_temp: int = 150,
+    pause_seconds: float = 2.0,
+) -> str:
+    """
+    Concatenate multiple fully-processed plate gcodes into one continuous print job.
+    Jobs 2+ have AMS load + purge line stripped; non-final jobs optionally keep filament
+    loaded (no retract/AMS unload) and optional nozzle preheat before next job.
+    """
+    if not segments:
+        return ""
+    if len(segments) == 1:
+        return segments[0]
+    has_cr = "\r\n" in segments[0] or segments[0].endswith("\r")
+    sep = "\r\n" if has_cr else "\n"
+    n = len(segments)
+    out: list[str] = []
+    for i, seg in enumerate(segments):
+        s = seg
+        if i > 0:
+            s = remove_ams_load_from_gcode(s)
+            s = remove_purge_line_from_gcode(s)
+        if i < n - 1 and skip_retraction_between_jobs:
+            s = _modify_from_last_executable_end(
+                s, lambda t: remove_retraction_from_end_section(t)
+            )
+        if i < n - 1 and reheat_between_jobs:
+            s = _modify_from_last_executable_end(
+                s, lambda t: replace_m104_s0_in_end_section(t, preheat_nozzle_temp)
+            )
+        if i > 0:
+            out.append(f"{sep}; === CHAINED JOB {i + 1} OF {n} ===")
+            out.append("M17 R ; restore Z current before next job homing")
+            if reheat_between_jobs:
+                out.append(f"M140 S{preheat_bed_temp} ; preheat bed for next job")
+                out.append(f"M104 S{preheat_nozzle_temp} ; preheat nozzle for next job")
+            out.append(f"G4 S{int(pause_seconds)} ; pause before next job")
+        out.append(s.strip())
+    return sep.join(out)
 
 
 def remove_purge_line_from_start_gcode(start_gcode: str) -> str:
