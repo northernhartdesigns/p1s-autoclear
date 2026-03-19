@@ -16,7 +16,7 @@ def _get_version() -> str:
         from importlib.metadata import version
         return version("p1s-autoclear")
     except Exception:
-        return "0.1.0"  # fallback when not installed
+        return "1.0.0"  # fallback when not installed
 
 
 __version__ = _get_version()

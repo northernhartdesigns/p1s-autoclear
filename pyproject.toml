@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "p1s-autoclear"
-version = "0.1.0"
+version = "1.0.0"
 description = "NHDFARM-style G-code injection for Bambu P1S auto-clear automation"
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = ["3d-printing", "bambu", "p1s", "nhdfarm", "gcode"]
 dependencies = []
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: End Users/Desktop",
 ]
 

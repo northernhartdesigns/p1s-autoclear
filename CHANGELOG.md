@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-03-19
+
+Stable baseline: single `main` branch workflow, GitHub “Update from GitHub” (fetch + fast-forward pull), expanded tests.
+
 ### Added
 
 - **Multi-file merge**: Add multiple 3MF files to the GUI, configure per-file settings (cooldown, loops, etc.), and export a single merged 3MF with per-plate auto-clear settings
@@ -18,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full settings stored in 3MF: reopening exported files restores all settings
 - Purge-line removal from sliced .gcode.3mf (Metadata/plate_*.gcode)
 - Replace purge block with minimal M400 in plate G-code to preserve Bambu Studio compatibility
+- Settings tab: Git / GitHub info and **Update from GitHub** (fetch + `pull --ff-only`)
 
 ### Fixed
 

@@ -934,7 +934,8 @@ def create_gui() -> tk.Tk:
     ttk.Label(
         git_frame,
         text=(
-            "Runs git fetch and git pull --ff-only (fast-forward only). "
+            "Runs git fetch and git pull --ff-only (fast-forward only) on your current branch. "
+            "For the stable line, check out branch main before updating. "
             "Uncommitted local changes are left as-is; fix conflicts in Git if pull fails."
         ),
         font=("", 8),

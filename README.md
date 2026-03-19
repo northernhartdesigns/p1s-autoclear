@@ -2,6 +2,8 @@
 
 NHDFARM-style G-code injection for Bambu Lab P1S (and P1P/X1C) automation. Injects configurable cooldown and pusher sweeps into your 3MF project so parts are automatically cleared after each print.
 
+**Repository root:** Clone and open the **`p1s-autoclear`** folder as the Git/project root (`pyproject.toml` and `.git` live there). An optional parent folder with launch scripts or scratch files is fine for local use only.
+
 ## Features
 
 - **3MF workflow**: Load a 3MF file → configure → export updated 3MF
